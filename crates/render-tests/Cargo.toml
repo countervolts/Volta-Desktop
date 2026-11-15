@@ -1,0 +1,15 @@
+[package]
+name = "volta-render-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "GPU tests for Volta's gpui renderer patches (blur effects)."
+
+[dependencies]
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.12", features = ["test-support"] }
+anyhow.workspace = true
+image = { version = "0.25", default-features = false }

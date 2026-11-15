@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = ["crates/app", "crates/audio", "crates/services", "crates/logic", "crates/render-tests"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "UNLICENSED"
+
+[workspace.dependencies]
+gpui           = { package = "gpui-pre",          version = "=0.3.12" }
+gpui_platform  = { package = "gpui-pre-platform", version = "=0.3.12" }
+gpui-component = "=0.9.1"
+symphonia      = { version = "=0.6.1", features = ["all"] }
+cpal           = "=0.18.2"
+souvlaki       = "=0.9.3"
+rusqlite       = { version = "=0.42.0", features = ["bundled"] }
+rfd            = "=0.18.0"
+reqwest        = { version = "=0.13.5", default-features = false, features = ["json", "stream", "rustls", "blocking"] }
+md-5           = "0.10"
+serde          = { version = "1", features = ["derive"] }
+serde_json     = "1"
+anyhow         = "1"
+thiserror      = "2"
+log            = "0.4"
+env_logger     = "0.11"
+rand           = "0.9"
+url            = "2"
+directories    = "6"
+parking_lot    = "0.12"
+crossbeam-channel = "0.5"
+rtrb           = "0.3"
+rubato         = "0.16"
+percent-encoding = "2"
+roxmltree      = "0.20"
+regex          = "1"
+unicode-normalization = "0.1"
+
+volta-logic    = { path = "crates/logic" }
+volta-audio    = { path = "crates/audio" }
+volta-services = { path = "crates/services" }
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev]
+opt-level = 1
+
+# Patched gpui crates (renderer blur/filter layers, text shadow, letter-spacing).
+# Versions stay at 0.3.12 so gpui-component's `=0.3.12`
+# requirement still resolves to these.
+[patch.crates-io]
+gpui-pre         = { path = "vendor/gpui" }
+gpui-pre-wgpu    = { path = "vendor/gpui-pre-wgpu" }
+gpui-pre-apple   = { path = "vendor/gpui-pre-apple" }
+gpui-pre-windows = { path = "vendor/gpui-pre-windows" }

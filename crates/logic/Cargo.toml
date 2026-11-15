@@ -1,0 +1,16 @@
+[package]
+name = "volta-logic"
+version.workspace = true
+edition.workspace = true
+description = "Pure ports of Volta's web logic (no gpui, no I/O)."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+percent-encoding.workspace = true
+roxmltree.workspace = true
+regex.workspace = true
+unicode-normalization.workspace = true
+indexmap = { version = "2", features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+rand.workspace = true

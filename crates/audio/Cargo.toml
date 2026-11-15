@@ -1,0 +1,20 @@
+[package]
+name = "volta-audio"
+version.workspace = true
+edition.workspace = true
+description = "Volta audio service: two-deck engine on cpal, symphonia decoding, HTTP Range source."
+
+[dependencies]
+volta-logic.workspace = true
+symphonia.workspace = true
+cpal.workspace = true
+rtrb.workspace = true
+rubato.workspace = true
+reqwest.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+log.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+env_logger.workspace = true

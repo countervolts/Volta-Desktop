@@ -1,0 +1,61 @@
+[package]
+name = "volta"
+version.workspace = true
+edition.workspace = true
+description = "Volta desktop player (gpui)."
+
+[[bin]]
+name = "volta"
+path = "src/main.rs"
+
+[dependencies]
+gpui.workspace = true
+# gpui-pre-platform pulls gpui-pre-linux with default-features = false: without
+# these the Linux build silently runs on the headless platform and never opens a window.
+gpui_platform = { workspace = true, features = ["wayland", "x11"] }
+gpui-component.workspace = true
+volta-logic.workspace = true
+volta-audio.workspace = true
+volta-services.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+serde.workspace = true
+indexmap = "2"
+serde_json.workspace = true
+parking_lot.workspace = true
+futures = "0.3"
+rand.workspace = true
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+tiny-skia = "0.11.4"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+resvg = "0.45.1"
+raw-window-handle = "0.6"
+# Native folder picker (`showDirectoryPicker`).
+rfd = "0.18"
+# OS media controls (`navigator.mediaSession`): MPRIS via pure-Rust zbus on
+# Linux, SMTC on Windows, MPNowPlayingInfoCenter on macOS.
+souvlaki = { version = "0.9.3", default-features = false, features = ["use_zbus"] }
+
+[build-dependencies]
+# Embeds assets/app-icon/volta.ico as icon resource 1 on Windows (gpui's
+# window class loads it); a no-op for other targets.
+winresource = "0.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.12", optional = true }
+
+[features]
+# Offscreen screenshots for web/native parity checks: run with
+# `VOLTA_SHOT=out.png` (see src/shot.rs). Pulls in gpui's test support.
+shots = ["gpui/test-support", "gpui_platform/test-support", "dep:gpui_wgpu"]
+
+# `cargo bundle --release` (cargo-bundle) builds Volta.app; macOS shows the
+# Dock icon from the bundle, not from the binary.
+[package.metadata.bundle]
+name = "Volta"
+identifier = "xyz.voltamusic.Volta"
+icon = ["../../assets/app-icon/volta.icns", "../../assets/app-icon/volta-512.png", "../../assets/app-icon/volta-256.png", "../../assets/app-icon/volta-128.png", "../../assets/app-icon/volta-32.png"]
+category = "public.app-category.music"
+short_description = "Volta music player"

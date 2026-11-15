@@ -1,0 +1,15 @@
+# Build output
+/target
+
+# Machine-specific cargo config (points target-dir at a local cache)
+/.cargo/
+
+# Local env / editor / OS
+.env
+.env.*
+!.env.example
+.DS_Store
+.idea/
+.vscode/
+*.log
+*.profraw

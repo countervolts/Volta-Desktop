@@ -1,0 +1,15 @@
+pub mod artist;
+pub mod collection;
+pub mod crash;
+pub mod connect;
+pub mod dialogs;
+pub mod folders;
+pub mod full_player;
+pub mod home;
+pub mod learning;
+pub mod library;
+pub mod search;
+pub mod selection;
+pub mod settings;
+pub mod stats;
+pub mod shell;
