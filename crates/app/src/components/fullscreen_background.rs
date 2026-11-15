@@ -26,6 +26,8 @@ use crate::theme;
 const FADE: f32 = 1.7;
 /// Buffer pixels across the visible width.
 const BUFFER_WIDTH: f32 = 96.0;
+/// Extra blurred texels rendered past every edge of the frame (see [`Scene::pad`]).
+const EDGE_PAD: u32 = 2;
 /// `blur(104px)`, as a standard deviation in CSS px.
 const BLUR_SIGMA: f32 = 104.0;
 /// The feColorMatrix grade (rows R, G, B; last column is the offset).
@@ -51,6 +53,19 @@ pub fn decode_cover(bytes: &[u8]) -> Option<Pixmap> {
     Some(pixmap)
 }
 
+/// Like [`decode_cover`], from a cover the app has already decoded (its in-memory cache).
+fn pixmap_from_image(image: &RenderImage) -> Option<Pixmap> {
+    const SIDE: u32 = 128;
+    let rgba = crate::covers::to_rgba(image)?;
+    let small = image::imageops::resize(&rgba, SIDE, SIDE, image::imageops::FilterType::Triangle);
+    let mut pixmap = Pixmap::new(SIDE, SIDE)?;
+    for (dst, src) in pixmap.pixels_mut().iter_mut().zip(small.pixels()) {
+        let [r, g, b, a] = src.0;
+        *dst = tiny_skia::ColorU8::from_rgba(r, g, b, a).premultiply();
+    }
+    Some(pixmap)
+}
+
 struct Scene {
     cover: Option<Arc<Pixmap>>,
     previous: Option<Arc<Pixmap>>,
@@ -59,6 +74,11 @@ struct Scene {
     width: f32,
     height: f32,
     canvas: [u8; 3],
+    /// Texels of margin added around the frame. The frame is a tiny image stretched far past
+    /// its size with bilinear filtering, so its outermost texels blend with whatever the
+    /// sprite atlas holds next to the tile (often black): dark edges that change from frame
+    /// to frame. The margin is drawn outside the window and clipped, so only it bleeds.
+    pad: u32,
 }
 
 fn turn(seconds: f32, period: f32, direction: f32) -> f32 {
@@ -180,12 +200,13 @@ fn render_scene(scene: &Scene) -> Option<Arc<RenderImage>> {
     }
 
     // Crop the visible region, grade, veil (50 % black) and lift (5 % white).
-    let (ow, oh) = (vw.round() as u32, vh.round() as u32);
-    let mut out = image::RgbaImage::new(ow.max(1), oh.max(1));
-    for y in 0..oh.max(1) {
-        for x in 0..ow.max(1) {
-            let sx = (x as f32 + mx).min(bw as f32 - 1.0) as usize;
-            let sy = (y as f32 + my).min(bh as f32 - 1.0) as usize;
+    let pad = scene.pad as f32;
+    let (ow, oh) = ((vw.round() as u32).max(1) + 2 * scene.pad, (vh.round() as u32).max(1) + 2 * scene.pad);
+    let mut out = image::RgbaImage::new(ow, oh);
+    for y in 0..oh {
+        for x in 0..ow {
+            let sx = (x as f32 + mx - pad).clamp(0.0, bw as f32 - 1.0) as usize;
+            let sy = (y as f32 + my - pad).clamp(0.0, bh as f32 - 1.0) as usize;
             let i = (sy * w + sx) * 3;
             let rgb = [data[i], data[i + 1], data[i + 2]];
             let mut pixel = [0u8; 4];
@@ -205,6 +226,8 @@ fn render_scene(scene: &Scene) -> Option<Arc<RenderImage>> {
 pub struct FullscreenBackground {
     state: Entity<AppState>,
     frame: Option<Arc<RenderImage>>,
+    /// The margin (texels) `frame` was rendered with.
+    frame_pad: u32,
     /// The frame shown before `frame`; freed from the sprite atlas once
     /// `frame` has been drawn in its place. Each 15 fps frame is a new
     /// image, so without this the atlas grows for as long as the player is open.
@@ -213,10 +236,20 @@ pub struct FullscreenBackground {
     cover: Option<Arc<Pixmap>>,
     previous: Option<Arc<Pixmap>>,
     fade_started: Option<Instant>,
+    /// When the first frame with a cover was shown, for the fade-in from the base grey.
+    shown_at: Option<Instant>,
+    /// Decoding the app's cached cover, so the background does not wait for its own download.
+    seeding: bool,
     started: Instant,
     size: (f32, f32),
     rendering: bool,
     _load: Option<Task<()>>,
+}
+
+/// The window's corners are square (Windows, macOS, maximized or tiled Linux).
+fn corners_are_square(cx: &gpui::App) -> bool {
+    let radii = cx.try_global::<crate::components::window_chrome::WindowCorners>().map(|c| c.0).unwrap_or_default();
+    [radii.top_left, radii.top_right, radii.bottom_left, radii.bottom_right].iter().all(|r| f32::from(*r) == 0.0)
 }
 
 impl FullscreenBackground {
@@ -224,11 +257,14 @@ impl FullscreenBackground {
         Self {
             state,
             frame: None,
+            frame_pad: 0,
             retired: None,
             cover_id: None,
             cover: None,
             previous: None,
             fade_started: None,
+            shown_at: None,
+            seeding: false,
             started: Instant::now(),
             size: (1440.0, 900.0),
             rendering: false,
@@ -239,11 +275,16 @@ impl FullscreenBackground {
     fn load_cover(&mut self, cover_id: Option<String>, cx: &mut Context<Self>) {
         self.cover_id = cover_id.clone();
         let (Some(id), Some(client)) = (cover_id, self.state.read(cx).client_handle()) else { return };
-        let task = cx.background_spawn(async move { client.cover_bytes(&id, Some(900)).ok().and_then(|b| decode_cover(&b)) });
+        self.seeding = false;
+        let fetch_id = id.clone();
+        let task = cx.background_spawn(async move { client.cover_bytes(&fetch_id, Some(900)).ok().and_then(|b| decode_cover(&b)) });
         // The new cover waits until it has decoded, then fades in over the old.
         self._load = Some(cx.spawn(async move |this, cx| {
             if let Some(pixmap) = task.await {
                 let _ = this.update(cx, |view, _| {
+                    if view.cover_id.as_deref() != Some(id.as_str()) {
+                        return;
+                    }
                     view.previous = view.cover.take();
                     view.cover = Some(Arc::new(pixmap));
                     view.fade_started = Some(Instant::now());
@@ -252,12 +293,38 @@ impl FullscreenBackground {
         }));
     }
 
+    /// While there is no cover yet, takes the one the app already holds (the full player loads
+    /// the same 900px cover for its artwork), which is usually ready the moment the player opens.
+    fn seed_from_cache(&mut self, cx: &mut Context<Self>) {
+        if self.cover.is_some() || self.seeding {
+            return;
+        }
+        let Some(id) = self.cover_id.clone() else { return };
+        let Some(image) = self.state.update(cx, |state, cx| state.cover(Some(&id), 900, cx)) else { return };
+        self.seeding = true;
+        let task = cx.background_spawn(async move { pixmap_from_image(&image) });
+        cx.spawn(async move |this, cx| {
+            let pixmap = task.await;
+            let _ = this.update(cx, |view, _| {
+                view.seeding = false;
+                // The background's own download may have finished first; then this is a no-op.
+                if let Some(pixmap) = pixmap.filter(|_| view.cover.is_none() && view.cover_id.as_deref() == Some(id.as_str())) {
+                    view.cover = Some(Arc::new(pixmap));
+                }
+            });
+        })
+        .detach();
+    }
+
     fn tick(&mut self, cx: &mut Context<Self>) {
         let cover_id = self.state.read(cx).player.read(cx).current_song().and_then(|s| s.cover_art.clone());
         if cover_id != self.cover_id {
             self.load_cover(cover_id, cx);
         }
-        if self.rendering {
+        self.seed_from_cache(cx);
+        // Without a cover the scene is only the graded canvas colour, which is black: show
+        // the base grey instead until a cover has decoded.
+        if self.rendering || (self.cover.is_none() && self.previous.is_none()) {
             return;
         }
         let fade = match self.fade_started {
@@ -266,6 +333,9 @@ impl FullscreenBackground {
         };
         let canvas = theme::tokens(cx).canvas;
         let rgba = gpui::Rgba::from(canvas);
+        // The margin is clipped by the window's rectangle, so it only works while the window
+        // corners are square; a rounded frame has to round the image itself.
+        let pad = if corners_are_square(cx) { EDGE_PAD } else { 0 };
         let scene = Scene {
             cover: self.cover.clone(),
             previous: self.previous.clone(),
@@ -275,6 +345,7 @@ impl FullscreenBackground {
             width: self.size.0,
             height: self.size.1,
             canvas: [(rgba.r * 255.0) as u8, (rgba.g * 255.0) as u8, (rgba.b * 255.0) as u8],
+            pad,
         };
         self.rendering = true;
         let task = cx.background_spawn(async move { render_scene(&scene) });
@@ -284,6 +355,7 @@ impl FullscreenBackground {
             let _ = this.update(cx, |view, cx| {
                 view.rendering = false;
                 if let Some(frame) = frame {
+                    view.frame_pad = pad;
                     if let Some(stale) = std::mem::replace(&mut view.retired, view.frame.replace(frame)) {
                         cx.drop_image(stale, None);
                     }
@@ -305,6 +377,11 @@ impl Render for FullscreenBackground {
         // runs at the refresh rate.
         self.tick(cx);
         window.request_animation_frame();
+        // The first frame fades in from the base grey rather than popping in.
+        if self.frame.is_some() && self.shown_at.is_none() {
+            self.shown_at = Some(Instant::now());
+        }
+        let fade_in = self.shown_at.map_or(0.0, |at| (at.elapsed().as_secs_f32() / 0.5).clamp(0.0, 1.0));
         div()
             .absolute()
             .inset_0()
@@ -315,7 +392,27 @@ impl Render for FullscreenBackground {
             // never matches the window's aspect exactly, and contain would
             // letterbox it with dark bars at the sides.
             .when_some(self.frame.clone(), |d, frame| {
-                d.child(crate::components::window_chrome::window_corners(img(frame).absolute().inset_0().size_full().object_fit(gpui::ObjectFit::Fill), cx))
+                let pad = self.frame_pad as f32;
+                if pad == 0.0 {
+                    return d.child(crate::components::window_chrome::window_corners(
+                        img(frame).absolute().inset_0().size_full().object_fit(gpui::ObjectFit::Fill).opacity(fade_in),
+                        cx,
+                    ));
+                }
+                // Draw the padded frame `pad` texels beyond every edge; the div clips it.
+                let size = frame.size(0);
+                let (fw, fh) = (size.width.0 as f32, size.height.0 as f32);
+                let (texel_w, texel_h) = (f32::from(viewport.width) / (fw - 2.0 * pad), f32::from(viewport.height) / (fh - 2.0 * pad));
+                d.child(
+                    img(frame)
+                        .absolute()
+                        .left(gpui::px(-pad * texel_w))
+                        .top(gpui::px(-pad * texel_h))
+                        .w(gpui::px(fw * texel_w))
+                        .h(gpui::px(fh * texel_h))
+                        .object_fit(gpui::ObjectFit::Fill)
+                        .opacity(fade_in),
+                )
             })
     }
 }
@@ -347,9 +444,10 @@ mod tests {
             width: 1440.0,
             height: 900.0,
             canvas: [32, 32, 32],
+            pad: EDGE_PAD,
         };
         let frame = render_scene(&scene).unwrap();
-        assert_eq!(frame.size(0).width.0, 96);
+        assert_eq!(frame.size(0).width.0 as u32, 96 + 2 * EDGE_PAD);
 
     }
 }

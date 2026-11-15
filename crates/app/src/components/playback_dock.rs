@@ -114,7 +114,7 @@ impl PlaybackDock {
         let narrow = viewport <= 640.0;
         let compact = viewport <= 860.0 || inspector_compact;
         let button = |id: &'static str, label: String, child: gpui::AnyElement, width: f32| {
-            let b = IconButton::new(id, label, child).color(tokens.text);
+            let b = IconButton::new(id, label, child).flat().color(tokens.secondary);
             if narrow { b.width(32.0).height(38.0) } else { b.width(width) }
         };
         let play_icon = if player.loading {
@@ -271,6 +271,7 @@ impl PlaybackDock {
             }))
             .child(
                 IconButton::new("mute", if muted { "Unmute" } else { "Mute" }, icon(if muted { "volume-x" } else { "volume2" }, 19.0))
+                    .flat()
                     .on_click(move |_, _, cx| p.update(cx, |p, cx| p.toggle_mute(cx))),
             )
             .child(
@@ -446,6 +447,7 @@ impl Render for PlaybackDock {
                         "Favorite current song",
                         icon_with("star", 17.0, None, favorite),
                     )
+                    .flat()
                     .width(24.0)
                     .active(favorite)
                     .disabled(!has_song)
@@ -470,6 +472,7 @@ impl Render for PlaybackDock {
                 };
                 a.child(
                     IconButton::new("infinite-play", if busy { "Adding songs to queue" } else { "Infinite Play" }, icon("infinity", 19.0))
+                        .flat()
                         .width(27.0)
                         .active(enabled)
                         .disabled(busy)
@@ -479,6 +482,7 @@ impl Render for PlaybackDock {
             .child({
                 let state = self.state.clone();
                 IconButton::new("lyrics", "Lyrics", icon("message-square-text", 18.0))
+                    .flat()
                     .width(27.0)
                     .active(panel == Some(Panel::Lyrics))
                     .on_click(move |_, _, cx| state.update(cx, |s, cx| s.toggle_panel(Panel::Lyrics, cx)))
@@ -486,6 +490,7 @@ impl Render for PlaybackDock {
             .child({
                 let state = self.state.clone();
                 IconButton::new("queue", "Playing Next", icon("list-music", 19.0))
+                    .flat()
                     .width(27.0)
                     .active(panel == Some(Panel::Queue))
                     .on_click(move |_, _, cx| state.update(cx, |s, cx| s.toggle_panel(Panel::Queue, cx)))
@@ -495,6 +500,7 @@ impl Render for PlaybackDock {
             .when(!hide_extras && wide && panel.is_none(), |a| {
                 a.child(
                     IconButton::new("expand", "Expand player", icon("expand", 17.0))
+                        .flat()
                         .width(27.0)
                         .disabled(!has_song)
                         .on_click({
@@ -511,6 +517,9 @@ impl Render for PlaybackDock {
 
         div()
             .id("playback-dock")
+            // The dock floats over the page: clicks and hovers on it must not
+            // reach whatever is underneath.
+            .occlude()
             .w_full()
             .max_w(sz(680.0))
             .min_h(sz(if narrow { 67.0 } else { 52.0 }))

@@ -7,13 +7,17 @@
 //! menu, a 5px band along the edges resizes, and small minimize / maximize /
 //! close buttons sit at the toolbar's end. When the compositor insists on
 //! server-side decorations (`Decorations::Server`) none of this is drawn.
-//! macOS and Windows keep their native title bars.
+//!
+//! Windows hides the native title bar too (`appears_transparent`) and uses the
+//! same layout, but moving, resizing and the three buttons are done by the OS
+//! through window-control hit regions (`WindowControlArea`), so no resize bands
+//! are drawn. macOS keeps its native title bar.
 
 use std::cell::Cell;
 
 use gpui::{
     AnyElement, App, CursorStyle, Decorations, InteractiveElement, IntoElement, MouseButton, ParentElement, ResizeEdge,
-    Styled, Window, div, prelude::*, px,
+    Styled, Window, WindowControlArea, div, prelude::*, px,
 };
 
 use crate::components::ui::{IconButton, icon};
@@ -49,9 +53,11 @@ pub fn record_corners(window: &Window, cx: &mut App) {
 /// Corner radius of the client-decorated window (Linux), like KDE/GNOME.
 pub const WINDOW_RADIUS: f32 = 10.0;
 
-/// The window should draw its own frame.
+/// The window has no native title bar, so the app provides the drag area and
+/// the window controls (Linux client-side decorations, or Windows).
 pub fn client_side(window: &Window) -> bool {
-    cfg!(any(target_os = "linux", target_os = "freebsd")) && matches!(window.window_decorations(), Decorations::Client { .. })
+    cfg!(target_os = "windows")
+        || (cfg!(any(target_os = "linux", target_os = "freebsd")) && matches!(window.window_decorations(), Decorations::Client { .. }))
 }
 
 /// `volta-warn-before-leave`: closing while music plays asks first. Returns
@@ -93,6 +99,11 @@ fn request_close(window: &mut Window, cx: &mut App) {
 /// Makes `element` move the window: drag to move, double-click to maximize or
 /// restore, right-click for the window menu.
 pub fn drag_area<E: InteractiveElement + IntoElement>(element: E) -> E {
+    // Windows: the OS moves the window and handles double-click / right-click
+    // for any region reported as the caption.
+    #[cfg(target_os = "windows")]
+    return element.window_control_area(WindowControlArea::Drag);
+    #[cfg(not(target_os = "windows"))]
     element
         .on_mouse_down(MouseButton::Left, |event, window, cx| {
             if event.click_count >= 2 {
@@ -111,6 +122,38 @@ pub fn drag_area<E: InteractiveElement + IntoElement>(element: E) -> E {
 /// Minimize / maximize / close, sized like the toolbar's icon buttons.
 pub fn controls(window: &Window) -> AnyElement {
     let maximized = window.is_maximized();
+    // Windows: the OS handles presses on these regions (Min / Max / Close
+    // hit-test results), so they are plain hover targets with no click handler.
+    if cfg!(target_os = "windows") {
+        let button = |id: &'static str, area: WindowControlArea, glyph: AnyElement, close: bool| {
+            div()
+                .id(id)
+                .window_control_area(area)
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(sz(30.0))
+                .rounded(sz(8.0))
+                .cursor(CursorStyle::Arrow)
+                .hover(move |s| s.bg(if close { gpui::hsla(0.0, 0.75, 0.5, 0.9) } else { gpui::hsla(0.0, 0.0, 0.5, 0.18) }))
+                .child(glyph)
+        };
+        return div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(sz(2.0))
+            .child(button("window-minimize", WindowControlArea::Min, icon("minus", 15.0).into_any_element(), false))
+            .child(button(
+                "window-maximize",
+                WindowControlArea::Max,
+                icon(if maximized { "copy" } else { "square" }, 13.0).into_any_element(),
+                false,
+            ))
+            .child(button("window-close", WindowControlArea::Close, icon("x", 16.0).into_any_element(), true))
+            .into_any_element();
+    }
     div()
         .flex()
         .flex_none()
@@ -138,6 +181,19 @@ pub fn controls(window: &Window) -> AnyElement {
 pub fn frame(content: AnyElement, floating_controls: bool, window: &Window) -> AnyElement {
     if !client_side(window) {
         return content;
+    }
+    // Windows: the OS provides the resize borders, so only the controls are added.
+    if cfg!(target_os = "windows") {
+        if !floating_controls {
+            return content;
+        }
+        return div()
+            .relative()
+            .size_full()
+            .child(content)
+            .child(drag_area(div().id("window-drag-strip").absolute().top_0().left_0().right(sz(110.0)).h(sz(20.0))))
+            .child(div().absolute().top(sz(10.0)).right(sz(12.0)).child(controls(window)))
+            .into_any_element();
     }
     let tiling = match window.window_decorations() {
         Decorations::Client { tiling } => tiling,

@@ -492,7 +492,14 @@ impl Render for FullPlayer {
                         // The rest of the top bar moves the window, like a
                         // title bar (Linux client-side frame).
                         .when(client_frame, |d| {
-                            d.child(crate::components::window_chrome::drag_area(div().id("fs-drag")).flex_1().h_full())
+                            // Windows: leave room for the floating window controls, whose
+                            // hit regions would otherwise lose to this drag area.
+                            d.child(
+                                crate::components::window_chrome::drag_area(div().id("fs-drag"))
+                                    .flex_1()
+                                    .h_full()
+                                    .mr(sz(if cfg!(target_os = "windows") { 110.0 } else { 0.0 })),
+                            )
                         }),
                     )
                     .child(

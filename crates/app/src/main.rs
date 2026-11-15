@@ -90,6 +90,9 @@ fn main() {
                     window_min_size: Some(size(px(320.0), px(480.0))),
                     titlebar: Some(TitlebarOptions {
                         title: Some("Volta".into()),
+                        // Windows: hide the native title bar; the app draws its own
+                        // controls and drag area (components/window_chrome.rs).
+                        appears_transparent: cfg!(target_os = "windows"),
                         ..Default::default()
                     }),
                     app_id: Some(app_icon::APP_ID.into()),
@@ -102,8 +105,9 @@ fn main() {
                         Default::default()
                     },
                     // Linux: no compositor title bar; the app draws its own
-                    // frame (components/window_chrome.rs). macOS and Windows
-                    // keep their native title bars.
+                    // frame (components/window_chrome.rs). Windows hides the
+                    // native title bar above and keeps the OS resize frame.
+                    // macOS keeps its native title bar.
                     window_decorations: cfg!(any(target_os = "linux", target_os = "freebsd"))
                         .then_some(gpui::WindowDecorations::Client),
                     ..Default::default()

@@ -386,8 +386,8 @@ impl Player {
         self.load_index(start, 0.0, true, cx);
     }
 
-    /// `restoreSession`: the saved queue at its position, playing only if it
-    /// was playing when saved.
+    /// `restoreSession`: the saved queue at its position. Reopening Volta never
+    /// starts audio by itself: `was_playing` is ignored, the song is loaded paused.
     #[allow(clippy::too_many_arguments)]
     pub fn restore_session(
         &mut self,
@@ -410,7 +410,8 @@ impl Player {
         self.shuffle = shuffle;
         self.repeat = repeat;
         self.original = original;
-        self.load_index(index, position.max(0.0), was_playing, cx);
+        let _ = was_playing;
+        self.load_index(index, position.max(0.0), false, cx);
     }
 
     pub fn toggle(&mut self, cx: &mut Context<Self>) {

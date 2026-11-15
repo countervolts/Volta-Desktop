@@ -336,6 +336,9 @@ pub fn render(state: &Entity<AppState>, _window: &mut Window, cx: &mut App) -> i
     let width = animated_width(theme::viewport_css_width(_window), motion.rail);
     div()
         .id("library-sidebar")
+        // The sidebar floats over the page: clicks and hovers on it must not
+        // reach whatever is underneath.
+        .occlude()
         .flex_none()
         .w(sz(width))
         .flex()
@@ -375,7 +378,7 @@ pub fn render(state: &Entity<AppState>, _window: &mut Window, cx: &mut App) -> i
             s.child(div().mt(sz(14.0)).child(link(
                 "source-link",
                 "View source code",
-                "https://github.com/countervolts/Volta-Player",
+                "https://github.com/countervolts/Volta-Desktop",
                 true,
             )))
             .child(div().mt(sz(7.0)).child(link("discord-link", "Join the Discord", "https://discord.gg/h5Hybq9SJs", false)))

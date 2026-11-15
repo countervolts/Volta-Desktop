@@ -7,7 +7,10 @@
 //! written to a local file instead, so no Subsonic token reaches the OS media
 //! service.
 
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
@@ -16,8 +19,19 @@ use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, M
 
 use crate::app_state::AppState;
 
+/// An OS media-session update, applied by [`MediaSession::flush`].
+enum Op {
+    Metadata { title: String, artist: String, album: String, cover_url: Option<String>, duration: Option<Duration> },
+    ClearMetadata,
+    Playback(MediaPlayback),
+}
+
 pub struct MediaSession {
-    controls: MediaControls,
+    controls: Rc<RefCell<MediaControls>>,
+    /// Updates not applied yet, in order.
+    queue: Rc<RefCell<VecDeque<Op>>>,
+    /// A task is already draining `queue`.
+    flushing: Rc<Cell<bool>>,
     /// (song id, cover written) last published, and the playing flag.
     published: (String, bool),
     playing: Option<bool>,
@@ -55,7 +69,16 @@ pub fn start(state: &Entity<AppState>, window: &Window, cx: &mut App) {
         log::warn!("media controls could not attach");
         return;
     }
-    state.update(cx, |s, _| s.media = Some(MediaSession { controls, published: Default::default(), playing: None, cover_file: None }));
+    state.update(cx, |s, _| {
+        s.media = Some(MediaSession {
+            controls: Rc::new(RefCell::new(controls)),
+            queue: Default::default(),
+            flushing: Default::default(),
+            published: Default::default(),
+            playing: None,
+            cover_file: None,
+        })
+    });
     poll(state.clone(), receiver, cx);
 }
 
@@ -104,6 +127,40 @@ fn poll(state: Entity<AppState>, receiver: Receiver<MediaControlEvent>, cx: &mut
     .detach();
 }
 
+impl MediaSession {
+    /// Applies the queued updates from a task of their own, never while the app
+    /// state is borrowed: on Windows `set_metadata` blocks on WinRT operations
+    /// (loading the cover file) and pumps window messages while it waits, which
+    /// would re-enter gpui (paint, hit-testing) inside the caller's borrow.
+    fn flush(&self, cx: &mut gpui::Context<AppState>) {
+        if self.flushing.replace(true) {
+            // The running task picks the new updates up, also when this call
+            // came from a message pumped inside one of its own updates.
+            return;
+        }
+        let (controls, queue, flushing) = (self.controls.clone(), self.queue.clone(), self.flushing.clone());
+        cx.spawn(async move |_, _| {
+            loop {
+                let Some(op) = queue.borrow_mut().pop_front() else { break };
+                let mut controls = controls.borrow_mut();
+                let _ = match op {
+                    Op::ClearMetadata => controls.set_metadata(MediaMetadata::default()),
+                    Op::Metadata { title, artist, album, cover_url, duration } => controls.set_metadata(MediaMetadata {
+                        title: Some(&title),
+                        artist: Some(&artist),
+                        album: Some(&album),
+                        cover_url: cover_url.as_deref(),
+                        duration,
+                    }),
+                    Op::Playback(state) => controls.set_playback(state),
+                };
+            }
+            flushing.set(false);
+        })
+        .detach();
+    }
+}
+
 impl AppState {
     /// Publishes the current song and playback state (`setMetadata`,
     /// `playbackState`, `setPositionState`) when they change.
@@ -122,20 +179,18 @@ impl AppState {
             media.published = key;
             media.playing = None;
             match &song {
-                None => {
-                    let _ = media.controls.set_metadata(MediaMetadata::default());
-                }
+                None => media.queue.borrow_mut().push_back(Op::ClearMetadata),
                 Some(song) => {
                     if let Some(old) = media.cover_file.take() {
                         let _ = std::fs::remove_file(old);
                     }
                     media.cover_file = cover.as_ref().and_then(|image| write_cover(&song.id, image));
                     let url = media.cover_file.as_ref().map(|p| format!("file://{}", p.display()));
-                    let _ = media.controls.set_metadata(MediaMetadata {
-                        title: Some(&song.title),
-                        artist: Some(song.artist.as_deref().unwrap_or("")),
-                        album: Some(song.album.as_deref().unwrap_or("")),
-                        cover_url: url.as_deref(),
+                    media.queue.borrow_mut().push_back(Op::Metadata {
+                        title: song.title.clone(),
+                        artist: song.artist.as_deref().unwrap_or("").to_string(),
+                        album: song.album.as_deref().unwrap_or("").to_string(),
+                        cover_url: url,
                         duration: (duration > 0.0).then(|| Duration::from_secs_f64(duration)),
                     });
                 }
@@ -149,7 +204,10 @@ impl AppState {
                 (Some(_), true) => MediaPlayback::Playing { progress },
                 (Some(_), false) => MediaPlayback::Paused { progress },
             };
-            let _ = media.controls.set_playback(state);
+            media.queue.borrow_mut().push_back(Op::Playback(state));
+        }
+        if !media.queue.borrow().is_empty() {
+            media.flush(cx);
         }
     }
 }

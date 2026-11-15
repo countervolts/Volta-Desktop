@@ -1279,14 +1279,14 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
 ** instance, so they cannot be indexed like the other primitives).
 */
 
-// Must match `VoltaEffectParams` in directx_renderer.rs (128 bytes).
+// Must match `VoltaEffectParams` in directx_renderer.rs (304 bytes).
 cbuffer VoltaEffectParams: register(b2) {
     float4 effect_region;       // blurred source region, frame px: x, y, width, height
     float2 effect_scratch_size; // scratch texels covered by the downsampled region
     float2 effect_texture_size; // size of the source and scratch textures
     float effect_downsample;
     float effect_sigma;         // Gaussian standard deviation, in scratch texels
-    uint effect_kind;           // 0 backdrop blur, 1 layer blur, 2 layer shadow
+    uint effect_kind;           // 0 backdrop blur, 1 layer blur, 2 layer shadow, 3 glass
     float effect_saturation;
     float4 effect_bounds;       // where the result is drawn, frame px
     float4 effect_content_mask;
@@ -1294,8 +1294,14 @@ cbuffer VoltaEffectParams: register(b2) {
     float4 effect_color;        // shadow tint, premultiplied
     float2 effect_offset;       // shadow offset
     float effect_opacity;
-    float effect_pad;
+    float effect_outset;        // glass only: how far the quad extends beyond effect_bounds
+    // Glass only: `GlassParams` as eleven float4s, in field order: tint, optics, blur, tone,
+    // light, rim, shadow, state, pointer, edge, finish.
+    float4 effect_glass[11];
 };
+
+// Glass only: the blurred backdrop (the sharp one is t_sprite).
+Texture2D<float4> t_glass_blur: register(t1);
 
 struct VoltaEffectOutput {
     float4 position: SV_Position;
@@ -1414,4 +1420,262 @@ float4 volta_effect_composite_fragment(VoltaEffectOutput input): SV_Target {
         return blurred * effect_opacity;
     }
     return effect_color * blurred.a * effect_opacity;
+}
+
+
+/*
+** Liquid Glass: a port of `fs_glass` in gpui-pre-wgpu's shaders_effects.wgsl.
+**
+** The backdrop was copied into the effect source texture (t_sprite, sharp) and
+** blurred into scratch A (t_glass_blur) by the passes above, so the glass samples
+** both: sharp, refracted taps at the rim, the frosted blur inside. The frame holds
+** gamma-encoded values; the optics work in linear light.
+*/
+
+static const float3 GLASS_LUMA = float3(0.2126, 0.7152, 0.0722);
+
+// Interleaved gradient noise in about +-1/2 of an 8-bit step: hides the banding of the
+// long, shallow gradients (shadow, frosted interior) without visible grain.
+float glass_dither(float2 position) {
+    float noise = frac(52.9829189 * frac(dot(position, float2(0.06711056, 0.00583715))));
+    return (noise - 0.5) / 255.0;
+}
+
+// Signed distance (device px, negative inside) to a rounded rectangle whose corners are
+// superellipses of exponent `n` (2 is a circular arc, larger approaches a continuous
+// "squircle" corner). Exact on straight edges, approximate inside the corner.
+float glass_sdf(float2 p, float2 half_size, Corners radii, float n) {
+    float r = min(pick_corner_radius(p, radii), min(half_size.x, half_size.y));
+    float2 q = abs(p) - half_size + r;
+    float2 outside_q = max(q, 0.0);
+    float outside = length(outside_q);
+    if (r > 0.0 && n > 2.0) {
+        outside = pow(pow(outside_q.x, n) + pow(outside_q.y, n), 1.0 / n);
+    }
+    return outside + min(max(q.x, q.y), 0.0) - r;
+}
+
+// Outward unit normal of the outline by central differences of the SDF. Corners are
+// rounded to at least `min_radius` first: a box's distance field flips its gradient along
+// the diagonals, which would show as a seam in the refraction.
+float2 glass_normal(float2 p, float2 half_size, Corners radii, float n, float min_radius) {
+    float e = 0.75;
+    Corners soft;
+    soft.top_left = max(radii.top_left, min_radius);
+    soft.top_right = max(radii.top_right, min_radius);
+    soft.bottom_right = max(radii.bottom_right, min_radius);
+    soft.bottom_left = max(radii.bottom_left, min_radius);
+    float2 gradient = float2(
+        glass_sdf(p + float2(e, 0.0), half_size, soft, n) - glass_sdf(p - float2(e, 0.0), half_size, soft, n),
+        glass_sdf(p + float2(0.0, e), half_size, soft, n) - glass_sdf(p - float2(0.0, e), half_size, soft, n)
+    );
+    float len = length(gradient);
+    return len > 1e-6 ? gradient / len : float2(0.0, -1.0);
+}
+
+// The sharp backdrop (linear light) at a frame position; only the copied region is valid.
+float3 glass_sharp(float2 position) {
+    float2 lo = effect_region.xy + 0.5;
+    float2 hi = effect_region.xy + effect_region.zw - 0.5;
+    float2 uv = clamp(position, lo, hi) / effect_texture_size;
+    return srgb_to_linear(t_sprite.SampleLevel(s_sprite, uv, 0).rgb);
+}
+
+// The blurred backdrop (linear light) at a frame position.
+float3 glass_blurred(float2 position) {
+    float2 scratch = (position - effect_region.xy) / effect_downsample;
+    float2 uv = clamp(scratch, float2(0.5, 0.5), effect_scratch_size - 0.5) / effect_texture_size;
+    return srgb_to_linear(t_glass_blur.SampleLevel(s_sprite, uv, 0).rgb);
+}
+
+// Height profile slope of the bezel, u = 0 at the outer edge and 1 where the glass is flat.
+// A convex squircle: it leaves the edge nearly vertical and flattens gradually, so the
+// bending is concentrated in a thin rim.
+float glass_bezel_slope(float u) {
+    float a = 1.0 - u;
+    float a3 = a * a * a;
+    float f = max(1.0 - a3 * a, 1e-4);
+    return a3 / pow(f, 0.75);
+}
+
+VoltaEffectOutput volta_effect_glass_vertex(uint vertex_id: SV_VertexID) {
+    float2 unit_vertex = float2((float)(vertex_id & 1u), (float)((vertex_id >> 1) & 1u));
+    float2 origin = effect_bounds.xy - effect_outset;
+    float2 size = effect_bounds.zw + effect_outset * 2.0;
+    float2 position = origin + unit_vertex * size;
+    VoltaEffectOutput output;
+    output.position = float4(position / global_viewport_size * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    return output;
+}
+
+// Output is premultiplied; the composite blend state is One, InvSrcAlpha.
+float4 volta_effect_glass_fragment(VoltaEffectOutput input): SV_Target {
+    float2 frag = input.position.xy;
+    float4 mask = effect_content_mask;
+    if (frag.x < mask.x || frag.y < mask.y || frag.x > mask.x + mask.z || frag.y > mask.y + mask.w) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+    float4 g_tint = effect_glass[0];
+    float4 g_optics = effect_glass[1];
+    float4 g_blur = effect_glass[2];
+    float4 g_tone = effect_glass[3];
+    float4 g_light = effect_glass[4];
+    float4 g_rim = effect_glass[5];
+    float4 g_shadow = effect_glass[6];
+    float4 g_state = effect_glass[7];
+    float4 g_pointer = effect_glass[8];
+    float4 g_edge = effect_glass[9];
+    float4 g_finish = effect_glass[10];
+
+    Corners radii;
+    radii.top_left = effect_corner_radii.x;
+    radii.top_right = effect_corner_radii.y;
+    radii.bottom_right = effect_corner_radii.z;
+    radii.bottom_left = effect_corner_radii.w;
+
+    float2 half_size = effect_bounds.zw * 0.5;
+    float2 mid_point = effect_bounds.xy + half_size;
+    float2 p = frag - mid_point;
+    float min_half = min(half_size.x, half_size.y);
+    // A corner radius that fills the shape (capsule, circle) is a true semicircle; the
+    // continuous-corner exponent only applies to genuinely rounded rectangles.
+    float largest_radius = max(max(radii.top_left, radii.top_right), max(radii.bottom_right, radii.bottom_left));
+    float corner_exponent = lerp(
+        max(g_state.x, 2.0),
+        2.0,
+        smoothstep(0.8, 0.98, largest_radius / max(min_half, 1.0))
+    );
+    float sdf = glass_sdf(p, half_size, radii, corner_exponent);
+    float appear = clamp(g_state.z, 0.0, 1.0) * effect_opacity;
+    float coverage = clamp(0.5 - sdf, 0.0, 1.0);
+
+    // Shadow: painted only outside the shape, since the glass itself is see-through.
+    float shadow_alpha = 0.0;
+    if (g_shadow.z > 0.0) {
+        float sigma = max(g_shadow.y * 0.5, 0.5);
+        float shadow_sdf = glass_sdf(
+            p - float2(0.0, g_shadow.x),
+            half_size + g_shadow.w,
+            radii,
+            corner_exponent
+        );
+        float falloff = 0.5 * (1.0 - tanh(1.2028 * shadow_sdf / (sigma * 1.41421356)));
+        // A blur wider than the shape would otherwise make the shadow as dark as a big one.
+        float size_factor = clamp(min_half * 2.0 / (sigma * 3.0), 0.2, 1.0);
+        shadow_alpha = g_shadow.z * falloff * size_factor * (1.0 - coverage) * appear;
+    }
+    // A tight, faint line where the glass meets what is behind it.
+    if (g_edge.z > 0.0) {
+        shadow_alpha += g_edge.z * exp(-max(sdf, 0.0) / 1.4) * (1.0 - coverage) * appear;
+    }
+    if (sdf > 0.5) {
+        return float4(0.0, 0.0, 0.0, shadow_alpha > 0.0 ? max(shadow_alpha + glass_dither(frag), 0.0) : 0.0);
+    }
+
+    float depth = max(-sdf, 0.0);
+    float bezel = clamp(g_optics.y, 1.0, max(min_half * 0.98, 1.0));
+    float2 normal = glass_normal(p, half_size, radii, corner_exponent, bezel);
+
+    // Refraction: a ray entering the sloped bezel is bent by Snell's law; the displacement
+    // of where it lands on the backdrop is the sampling offset.
+    float refraction_amount = g_optics.x * appear;
+    float ior = max(g_optics.z, 1.02);
+    float2 refract_offset = float2(0.0, 0.0);
+    if (depth < bezel && refraction_amount != 0.0) {
+        float u = clamp(depth / bezel, 0.0, 1.0);
+        float slope = glass_bezel_slope(u) * g_optics.w / bezel;
+        float3 surface_normal = normalize(float3(normal * slope, 1.0));
+        float3 refracted = refract(float3(0.0, 0.0, -1.0), surface_normal, 1.0 / ior);
+        float tan_slope = length(refracted.xy) / max(-refracted.z, 1e-3);
+        // The steepest possible slope bends the ray to asin(1 / ior).
+        float sine_limit = 1.0 / ior;
+        float tangent_limit = sine_limit / sqrt(1.0 - sine_limit * sine_limit);
+        refract_offset = -normal * (clamp(tan_slope / tangent_limit, 0.0, 1.0) * refraction_amount);
+    }
+
+    float2 sample_position = frag + refract_offset;
+    float dispersion = g_blur.z;
+    float3 color = glass_sharp(sample_position);
+    if (dispersion != 0.0) {
+        color = float3(
+            glass_sharp(frag + refract_offset * (1.0 - dispersion)).r,
+            color.g,
+            glass_sharp(frag + refract_offset * (1.0 + dispersion)).b
+        );
+    }
+    float blur_radius = g_blur.x * appear;
+    if (blur_radius > 0.5) {
+        float3 blurred = glass_blurred(sample_position);
+        // The rim keeps more of the sharp, refracted backdrop than the interior does, so the
+        // ends and edges of the glass stay see-through while the middle is frosted.
+        float blur_mix = lerp(g_blur.y, 1.0, smoothstep(0.0, bezel * 1.5, depth));
+        color = lerp(color, blurred, blur_mix);
+    }
+
+    // Local backdrop luminance decides whether glass with automatic appearance reads as
+    // light or dark.
+    float appearance = g_tone.w;
+    if (appearance < 0.0) {
+        float region_luma = dot(glass_blurred(mid_point), GLASS_LUMA);
+        float region_gamma_luma = linear_to_srgb(float3(region_luma, region_luma, region_luma)).x;
+        appearance = 1.0 - smoothstep(0.28, 0.62, region_gamma_luma);
+    }
+
+    // Tone is applied to encoded values, where brightness and contrast behave intuitively.
+    float3 encoded = linear_to_srgb(max(color, 0.0));
+    float3 untoned = encoded;
+    encoded = (encoded - 0.5) * g_tone.y + 0.5;
+    encoded = encoded * g_tone.x;
+    float3 veil_color = lerp(float3(1.0, 1.0, 1.0), float3(0.06, 0.06, 0.06), appearance);
+    encoded = lerp(encoded, veil_color, g_tone.z);
+    float encoded_luma = dot(encoded, GLASS_LUMA);
+    encoded = lerp(float3(encoded_luma, encoded_luma, encoded_luma), encoded, g_blur.w);
+    encoded = clamp(encoded, 0.0, 1.0);
+
+    // Tint is a tone ramp keyed to the brightness underneath, not a flat overlay.
+    if (g_tint.a > 0.0) {
+        float brightness = clamp(dot(encoded, GLASS_LUMA), 0.0, 1.0);
+        float3 tinted = g_tint.rgb * lerp(0.45, 1.25, brightness);
+        encoded = lerp(encoded, clamp(tinted, 0.0, 1.0), clamp(g_tint.a, 0.0, 1.0) * 0.9);
+    }
+    // Darkening just inside the rim, fading inward.
+    if (g_edge.x > 0.0) {
+        float band = exp(-depth / max(g_edge.y, 0.5)) * g_edge.x * (1.0 - appearance);
+        encoded = encoded * (1.0 - clamp(band, 0.0, 0.9));
+    }
+    // At appear = 0 the material is the plain backdrop; lensing, tone and shading arrive together.
+    encoded = lerp(untoned, encoded, appear);
+
+    // Edge light, after Apple's two-light model: a thin specular hairline whose strength
+    // follows how much the outline faces each of two opposed lights, over a faint ambient
+    // outline that runs all the way round, plus a short soft bevel just inside it on the lit
+    // sides. It is screened over the face in encoded space (a highlight lightens towards
+    // white; adding it in linear light reads as grey fog on dark glass).
+    float2 light_0 = float2(cos(g_light.x), -sin(g_light.x));
+    float2 light_1 = float2(cos(g_light.y), -sin(g_light.y));
+    float facing_0 = pow(max(dot(normal, light_0), 0.0), g_rim.z);
+    float facing_1 = pow(max(dot(normal, light_1), 0.0), g_rim.z);
+    float lit_amount = clamp(facing_0 * g_light.z + facing_1 * g_light.w, 0.0, 1.5);
+    float rim_width = max(g_rim.x, 0.25);
+    // The hairline's profile is offset per colour channel, so wherever it is lit its inner
+    // edge fringes into colour (seen in Apple's footage on a plain grey backdrop).
+    float3 channel_shift = float3(-1.0, 0.0, 1.0) * g_edge.w;
+    float3 rim_profile = exp(-pow(max(depth + channel_shift, 0.0) / rim_width, g_rim.y));
+    float bevel = exp(-depth / max(g_finish.z, 0.5)) * g_finish.y * lit_amount;
+    float3 rim_energy = clamp((g_finish.x + lit_amount) * rim_profile + bevel, 0.0, 1.0) * appear;
+    // Apple's rim is the backdrop's own colour lifted, not white: over a teal face it is a pale
+    // teal. The face colour, normalised to its brightest channel, tints the light.
+    float3 face_hue = encoded / max(max(encoded.r, max(encoded.g, encoded.b)), 0.08);
+    float3 rim_light = lerp(float3(1.0, 1.0, 1.0), face_hue, 0.55);
+    encoded = 1.0 - (1.0 - encoded) * (1.0 - rim_energy * rim_light);
+
+    // Light that starts under the pointer and spreads across the surface.
+    if (g_pointer.z > 0.0 && g_pointer.w > 0.0) {
+        float pointer_distance = length(frag - (effect_bounds.xy + g_pointer.xy));
+        float glow_radius = g_pointer.z * 0.5;
+        encoded += g_pointer.w * 0.2 * exp(-(pointer_distance * pointer_distance) / (2.0 * glow_radius * glow_radius));
+    }
+
+    float3 output_encoded = clamp(encoded, 0.0, 1.0) + glass_dither(frag);
+    return float4(output_encoded * coverage, coverage + shadow_alpha);
 }

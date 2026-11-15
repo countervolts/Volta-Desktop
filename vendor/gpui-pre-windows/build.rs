@@ -46,6 +46,7 @@ mod shader_compilation {
             "volta_effect_blur_h",
             "volta_effect_blur_v",
             "volta_effect_composite",
+            "volta_effect_glass",
         ];
 
         let rust_binding_path = format!("{}/shaders_bytes.rs", out_dir);

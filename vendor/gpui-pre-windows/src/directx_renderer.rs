@@ -63,7 +63,7 @@ pub(crate) struct DirectXRenderer {
     active_render_target: Option<ID3D11RenderTargetView>,
 }
 
-/// Modified for Volta: must match `VoltaEffectParams` in shaders.hlsl (128 bytes).
+/// Modified for Volta: must match `VoltaEffectParams` in shaders.hlsl (304 bytes).
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C, align(16))]
 struct VoltaEffectParams {
@@ -80,10 +80,13 @@ struct VoltaEffectParams {
     color: [f32; 4],
     offset: [f32; 2],
     opacity: f32,
-    pad: f32,
+    /// Glass only: how far the quad extends beyond `bounds` (the shadow).
+    outset: f32,
+    /// Glass only: `GlassParams` as eleven `float4`s.
+    glass: [[f32; 4]; 11],
 }
 
-const _: () = assert!(std::mem::size_of::<VoltaEffectParams>() == 128);
+const _: () = assert!(std::mem::size_of::<VoltaEffectParams>() == 304);
 
 /// Modified for Volta.
 struct VoltaEffectShaders {
@@ -111,6 +114,7 @@ struct VoltaEffectPipelines {
     blur_h: VoltaEffectShaders,
     blur_v: VoltaEffectShaders,
     composite: VoltaEffectShaders,
+    glass: VoltaEffectShaders,
     replace_blend: ID3D11BlendState,
     premultiplied_blend: ID3D11BlendState,
     params: Option<ID3D11Buffer>,
@@ -131,6 +135,7 @@ impl VoltaEffectPipelines {
             blur_h: VoltaEffectShaders::new(device, ShaderModule::VoltaEffectBlurH)?,
             blur_v: VoltaEffectShaders::new(device, ShaderModule::VoltaEffectBlurV)?,
             composite: VoltaEffectShaders::new(device, ShaderModule::VoltaEffectComposite)?,
+            glass: VoltaEffectShaders::new(device, ShaderModule::VoltaEffectGlass)?,
             replace_blend,
             // One, InvSrcAlpha: the composite outputs premultiplied color.
             premultiplied_blend: create_blend_state_for_path_sprite(device)?,
@@ -604,7 +609,8 @@ impl DirectXRenderer {
 
         for effect_ix in range {
             let effect = &scene.effects[effect_ix];
-            let is_layer = !matches!(effect.kind, BlurEffectKind::BackdropBlur | BlurEffectKind::Glass); // Modified for Volta: glass is only drawn by the wgpu renderer; here it degrades to a backdrop blur.
+            let is_layer = !matches!(effect.kind, BlurEffectKind::BackdropBlur | BlurEffectKind::Glass);
+            let is_glass = effect.kind == BlurEffectKind::Glass;
             if is_layer && effect.layer >= scene.filter_layers.len() {
                 continue;
             }
@@ -622,9 +628,10 @@ impl DirectXRenderer {
                 downsample: plan.downsample as f32,
                 sigma: plan.sigma,
                 kind: match effect.kind {
-                    BlurEffectKind::BackdropBlur | BlurEffectKind::Glass => 0,
+                    BlurEffectKind::BackdropBlur => 0,
                     BlurEffectKind::LayerBlur => 1,
                     BlurEffectKind::LayerShadow => 2,
+                    BlurEffectKind::Glass => 3,
                 },
                 saturation: effect.saturation,
                 bounds: bounds(effect.bounds),
@@ -633,7 +640,20 @@ impl DirectXRenderer {
                 color: [color.r * color.a, color.g * color.a, color.b * color.a, color.a],
                 offset: [effect.offset.x.0, effect.offset.y.0],
                 opacity: effect.opacity,
-                pad: 0.,
+                outset: if is_glass { effect.glass.outset().ceil() } else { 0. },
+                glass: [
+                    effect.glass.tint,
+                    effect.glass.optics,
+                    effect.glass.blur,
+                    effect.glass.tone,
+                    effect.glass.light,
+                    effect.glass.rim,
+                    effect.glass.shadow,
+                    effect.glass.state,
+                    effect.glass.pointer,
+                    effect.glass.edge,
+                    effect.glass.finish,
+                ],
             };
 
             // 1. The source.
@@ -709,11 +729,20 @@ impl DirectXRenderer {
                 context.RSSetViewports(Some(slice::from_ref(&viewport)));
                 context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
                 context.OMSetBlendState(&effects.premultiplied_blend, None, 0xFFFFFFFF);
-                context.VSSetShader(&effects.composite.vertex, None);
-                context.PSSetShader(&effects.composite.fragment, None);
-                context.PSSetShaderResources(0, Some(slice::from_ref(&textures.a_srv)));
-                context.Draw(4, 0);
-                context.PSSetShaderResources(0, Some(&[None]));
+                if is_glass {
+                    // Slot 0: the sharp backdrop copy; slot 1: the blurred one.
+                    context.VSSetShader(&effects.glass.vertex, None);
+                    context.PSSetShader(&effects.glass.fragment, None);
+                    context.PSSetShaderResources(0, Some(&[textures.source_srv.clone(), textures.a_srv.clone()]));
+                    context.Draw(4, 0);
+                    context.PSSetShaderResources(0, Some(&[None, None]));
+                } else {
+                    context.VSSetShader(&effects.composite.vertex, None);
+                    context.PSSetShader(&effects.composite.fragment, None);
+                    context.PSSetShaderResources(0, Some(slice::from_ref(&textures.a_srv)));
+                    context.Draw(4, 0);
+                    context.PSSetShaderResources(0, Some(&[None]));
+                }
             }
         }
         Ok(())
@@ -807,6 +836,10 @@ impl DirectXRenderer {
         self.height = height;
 
         // Clear the render target before resizing
+        // Modified for Volta: `active_render_target` is a clone of the back buffer's view kept
+        // from the last frame. A live reference to the back buffer makes `ResizeBuffers` fail
+        // with DXGI_ERROR_INVALID_CALL, so it has to be released first.
+        self.active_render_target = None;
         let devices = self.devices.as_ref().context("devices missing")?;
         unsafe { devices.device_context.OMSetRenderTargets(None, None) };
         let resources = self.resources.as_mut().context("resources missing")?;
@@ -2043,6 +2076,7 @@ pub(crate) mod shader_resources {
         VoltaEffectBlurH,
         VoltaEffectBlurV,
         VoltaEffectComposite,
+        VoltaEffectGlass,
     }
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -2132,6 +2166,10 @@ pub(crate) mod shader_resources {
                     ShaderTarget::Vertex => VOLTA_EFFECT_COMPOSITE_VERTEX_BYTES,
                     ShaderTarget::Fragment => VOLTA_EFFECT_COMPOSITE_FRAGMENT_BYTES,
                 },
+                ShaderModule::VoltaEffectGlass => match target {
+                    ShaderTarget::Vertex => VOLTA_EFFECT_GLASS_VERTEX_BYTES,
+                    ShaderTarget::Fragment => VOLTA_EFFECT_GLASS_FRAGMENT_BYTES,
+                },
             };
             Self { inner: bytes }
         }
@@ -2216,6 +2254,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::VoltaEffectBlurH => "volta_effect_blur_h",
                 ShaderModule::VoltaEffectBlurV => "volta_effect_blur_v",
                 ShaderModule::VoltaEffectComposite => "volta_effect_composite",
+                ShaderModule::VoltaEffectGlass => "volta_effect_glass",
             }
         }
     }

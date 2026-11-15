@@ -75,6 +75,9 @@ pub struct IconButton {
     /// `.fullscreen-dialog .icon-button`: no hover background; the icon
     /// brightens to white.
     bare: bool,
+    /// No hover background, like `bare`, but the icon brightens to the theme's text colour
+    /// instead of white (the playback dock sits on themed, not always-dark, glass).
+    flat: bool,
     tooltip: Option<SharedString>,
     on_click: Option<ClickHandler>,
 }
@@ -91,6 +94,7 @@ impl IconButton {
             active: false,
             disabled: false,
             bare: false,
+            flat: false,
             tooltip: None,
             on_click: None,
         }
@@ -120,6 +124,11 @@ impl IconButton {
 
     pub fn active(mut self, active: bool) -> Self {
         self.active = active;
+        self
+    }
+
+    pub fn flat(mut self) -> Self {
+        self.flat = true;
         self
     }
 
@@ -168,11 +177,11 @@ impl RenderOnce for IconButton {
         if self.disabled {
             button = button.opacity(0.38);
         } else {
-            let bare = self.bare;
+            let (bare, flat) = (self.bare, self.flat);
             let hover_text = if self.active { tokens.accent } else if bare { gpui::white() } else { tokens.text };
             button = button
                 .cursor_pointer()
-                .hover(move |style| if bare { style.text_color(hover_text) } else { style.bg(tokens.hover).text_color(hover_text) })
+                .hover(move |style| if bare || flat { style.text_color(hover_text) } else { style.bg(tokens.hover).text_color(hover_text) })
                 .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx));
             if let Some(handler) = self.on_click {
                 button = button.on_click(handler);
