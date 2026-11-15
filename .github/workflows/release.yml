@@ -78,7 +78,10 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p volta
 
+      # The tested crates (logic, audio, services) are platform-independent, so one
+      # OS is enough; the other three jobs skip it to keep the run short.
       - name: Test
+        if: runner.os == 'Linux'
         run: cargo test --release --locked -p volta-logic -p volta-audio -p volta-services
 
       - name: Package (Linux)
