@@ -62,6 +62,26 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history so the next step can date vendor/ by its last commit.
+          fetch-depth: 0
+
+      # Cargo decides whether a path dependency changed by file mtime, and a fresh
+      # checkout stamps every file "now". Without this, the vendored gpui crates and
+      # everything built on them recompile on every run even though the cache holds
+      # their artifacts. Dating vendor/ by its last commit keeps the mtimes stable
+      # until vendor/ really changes (then they are newer than the cache and rebuild).
+      - name: Pin vendor/ mtimes
+        shell: bash
+        run: |
+          py=$(command -v python3 || command -v python)
+          ts=$(git log -1 --format=%ct -- vendor)
+          git ls-files -z vendor | "$py" -c "
+          import os, sys
+          ts = int('$ts')
+          for p in filter(None, sys.stdin.buffer.read().split(b'\\0')):
+              os.utime(p, (ts, ts))
+          "
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
