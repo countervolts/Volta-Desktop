@@ -240,6 +240,9 @@ pub struct AppState {
     pub infinite: crate::infinite::InfinitePlay,
     /// `connectionState`.
     pub connection: crate::components::connection_banner::Connection,
+    /// A newer release found by the update check (shown as a banner).
+    pub update: Option<volta_logic::update::ReleaseInfo>,
+    pub update_checking: bool,
     /// AutoMix track analysis queue.
     pub analyzer: crate::automix_analysis::Analyzer,
     /// Local music ("This device").
@@ -483,6 +486,8 @@ impl AppState {
             local: Default::default(),
             analyzer: Default::default(),
             connection: Default::default(),
+            update: None,
+            update_checking: false,
             stats_period: volta_logic::listening_stats::StatsPeriod::Week,
             stats_offset: 0,
             folder_tree: None,
@@ -504,6 +509,10 @@ impl AppState {
             filter: String::new(),
         };
         state.restore_session(cx);
+        // Never phone home from screenshot runs or when explicitly disabled.
+        if std::env::var_os("VOLTA_SHOT").is_none() && std::env::var_os("VOLTA_NO_UPDATE_CHECK").is_none() {
+            state.check_for_updates(false, cx);
+        }
         state
     }
 

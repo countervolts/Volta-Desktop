@@ -37,6 +37,10 @@ pub const LOCAL_SOURCE_MODE_KEY: &str = "volta-source-mode";
 pub const SEARCH_HISTORY_KEY: &str = "volta-search-history";
 pub const SHARE_PROVIDER_KEY: &str = "volta-share-provider";
 pub const FRAME_MONITOR_KEY: &str = "volta-frame-monitor";
+/// Native-only: "false" turns the daily release check off.
+pub const UPDATE_CHECK_KEY: &str = "volta-update-check";
+pub const UPDATE_SKIPPED_KEY: &str = "volta-update-skipped-version";
+pub const UPDATE_LAST_CHECK_KEY: &str = "volta-update-last-check";
 pub const REWARD_WINDOW_MS: u64 = 6 * 60 * 60 * 1000;
 
 // Keys written inline in App.tsx.

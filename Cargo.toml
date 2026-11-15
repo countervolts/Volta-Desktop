@@ -5,7 +5,7 @@ members = ["crates/app", "crates/audio", "crates/services", "crates/logic", "cra
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "UNLICENSED"
+license = "GPL-3.0-only"
 
 [workspace.dependencies]
 gpui           = { package = "gpui-pre",          version = "=0.3.12" }
@@ -39,6 +39,10 @@ unicode-normalization = "0.1"
 volta-logic    = { path = "crates/logic" }
 volta-audio    = { path = "crates/audio" }
 volta-services = { path = "crates/services" }
+
+[profile.release]
+# Smaller downloads: drop symbols from release binaries.
+strip = true
 
 [profile.dev.package."*"]
 opt-level = 2

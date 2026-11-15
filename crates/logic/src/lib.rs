@@ -27,3 +27,4 @@ pub mod share_links;
 pub mod shortcuts;
 pub mod song_credits;
 pub mod storage;
+pub mod update;

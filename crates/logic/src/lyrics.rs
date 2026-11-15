@@ -710,7 +710,7 @@ pub fn pick_synced_lrclib_result(records: &serde_json::Value, song: &Song) -> Op
         _ => f64::INFINITY,
     };
     // Native ranking (the web sorts by duration alone): an exact title beats
-    // a containing one ("Memory Merge" vs "Memory Merge (Paused)"), and among
+    // a containing one ("Song" vs "Song (Live)"), and among
     // versions within a few seconds of the song, word-timed lyrics win; then
     // the closest duration.
     let exact = |item: &LrclibRecord| normalize_lrclib_value(item.track_name.as_deref().unwrap_or("")) == title;
@@ -735,12 +735,12 @@ mod tests {
     #[test]
     fn lrclib_prefers_exact_title_and_word_timing() {
         let records = json!([
-            {"trackName": "Memory Merge (Paused)", "artistName": "YonKaGor", "duration": 272.608, "syncedLyrics": "[00:31.56] Did it really happen"},
-            {"trackName": "Memory Merge", "artistName": "YonKaGor", "duration": 273.0, "syncedLyrics": "[00:31.56] Did it really happen"},
-            {"trackName": "Memory Merge", "artistName": "YonKaGor", "duration": 273.0, "syncedLyrics": "[00:31.61]<00:31.61>Did <00:31.96>it"},
-            {"trackName": "Memory Merge", "artistName": "YonKaGor", "duration": 300.0, "syncedLyrics": "[00:31.61]<00:31.61>Far <00:31.96>off"}
+            {"trackName": "Example Song (Live)", "artistName": "Example Artist", "duration": 272.608, "syncedLyrics": "[00:31.56] Did it really happen"},
+            {"trackName": "Example Song", "artistName": "Example Artist", "duration": 273.0, "syncedLyrics": "[00:31.56] Did it really happen"},
+            {"trackName": "Example Song", "artistName": "Example Artist", "duration": 273.0, "syncedLyrics": "[00:31.61]<00:31.61>Did <00:31.96>it"},
+            {"trackName": "Example Song", "artistName": "Example Artist", "duration": 300.0, "syncedLyrics": "[00:31.61]<00:31.61>Far <00:31.96>off"}
         ]);
-        let song = Song { title: "Memory Merge".into(), artist: Some("YonKaGor".into()), duration: Some(272.6087), ..Default::default() };
+        let song = Song { title: "Example Song".into(), artist: Some("Example Artist".into()), duration: Some(272.6087), ..Default::default() };
         let picked = pick_synced_lrclib_result(&records, &song).unwrap();
         assert_eq!(picked.word_by_word, Some(true));
         assert_eq!(picked.lines[0].text, "Did it");

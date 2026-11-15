@@ -28,7 +28,8 @@ fn hwnd(window: &Window) -> Option<*mut std::ffi::c_void> {
     #[cfg(target_os = "windows")]
     {
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-        if let Ok(handle) = window.window_handle() {
+        // `Window` also has an inherent `window_handle()` (gpui's own id), so name the trait.
+        if let Ok(handle) = HasWindowHandle::window_handle(window) {
             if let RawWindowHandle::Win32(h) = handle.as_raw() {
                 return Some(h.hwnd.get() as *mut std::ffi::c_void);
             }

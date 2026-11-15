@@ -20,7 +20,7 @@
     <td align="center"><img src="img/album.webp" width="400"><br><sub><b>Album</b> · track list and actions</sub></td>
   </tr>
   <tr>
-    <td align="center" colspan="2"><img src="img/player.webp" width="400"><br><sub><b>Full player</b> · artwork-tinted background</sub></td>
+    <td align="center" colspan="2"><img src="img/player.webp" width="400"><br><sub><b>Full player</b> · synced lyrics</sub></td>
   </tr>
 </table>
 
@@ -30,7 +30,7 @@ Volta Desktop is a native port of [Volta Player](https://player.voltamusic.xyz),
 
 - **Playback** Gapless and crossfade, AutoMix, ReplayGain, shuffle/repeat, and an infinite autoplay queue.
 - **Library** Home shelves and recommendations, albums, artists, songs, folders, playlists, favorites, search, and listening stats.
-- **Lyrics** Time-synced lyrics (via [LRCLIB](https://lrclib.net)) with a full-screen player.
+- **Lyrics** Time-synced lyrics in a full-screen player, from your server, [LRCLIB](https://lrclib.net), or `.lrc` files next to your local tracks.
 - **Sources** A Navidrome / Subsonic server, or a folder of local files.
 - **Themes** Dark, light, high-contrast, or follow the system.
 
@@ -44,3 +44,7 @@ cargo test --workspace           # tests
 ```
 
 Also check out [Volta iOS](https://github.com/countervolts/Volta) and the web player at <https://player.voltamusic.xyz>.
+
+## License
+
+Volta Desktop is licensed under the **GPLv3** (see [LICENSE](LICENSE)). The vendored gpui crates in `vendor/` keep their own upstream licenses, and the icons in `assets/icons/` are from [Lucide](https://lucide.dev) (ISC).

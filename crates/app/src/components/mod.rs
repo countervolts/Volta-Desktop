@@ -1,6 +1,7 @@
 pub mod album_grid;
 pub mod charts;
 pub mod connection_banner;
+pub mod update_banner;
 pub mod fullscreen_background;
 pub mod genre_art;
 pub mod inspector;

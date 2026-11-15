@@ -554,6 +554,9 @@ fn playback(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyEleme
 fn privacy(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyElement {
     let external = pref(state, keys::EXTERNAL_LYRICS_KEY, cx) == "true";
     let history = pref(state, keys::LISTENING_HISTORY_ENABLED_KEY, cx) != "false";
+    let update_check = pref(state, keys::UPDATE_CHECK_KEY, cx) != "false";
+    let checking = state.read(cx).update_checking;
+    let (s7, s8) = (state.clone(), state.clone());
     let (s1, s2, s3, s4, s5, s6) = (state.clone(), state.clone(), state.clone(), state.clone(), state.clone(), state.clone());
     let profile = state.read(cx).profile_summary();
     let storage_summary = state.read(cx).storage_summary();
@@ -605,6 +608,28 @@ fn privacy(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyElemen
                 checkbox("external-lyrics", external, tokens, move |v, cx| {
                     set_pref(&s1, keys::EXTERNAL_LYRICS_KEY, if v { "true" } else { "false" }, cx)
                 }),
+            ),
+            row(
+                tokens,
+                "green",
+                "refresh-cw",
+                "Check for updates",
+                format!(
+                    "Once a day, ask GitHub for the latest Volta release and tell you if there is one. Nothing is installed automatically. You have {}.",
+                    env!("CARGO_PKG_VERSION")
+                ),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(sz(10.0))
+                    .child(
+                        secondary_button("check-updates-now", if checking { "Checking…" } else { "Check now" }, "", cx)
+                            .on_click(move |_, _, cx| s8.update(cx, |s, cx| s.check_for_updates(true, cx))),
+                    )
+                    .child(checkbox("update-check", update_check, tokens, move |v, cx| {
+                        set_pref(&s7, keys::UPDATE_CHECK_KEY, if v { "true" } else { "false" }, cx)
+                    }))
+                    .into_any_element(),
             ),
             row(
                 tokens,

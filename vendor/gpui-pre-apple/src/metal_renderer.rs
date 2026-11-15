@@ -1770,7 +1770,7 @@ impl MetalRenderer {
     }
 
     fn draw_surfaces(
-        &mut self,
+        &self,
         surfaces: &[PaintSurface],
         first_surface: usize,
         instance_bindings: &InstanceBindings,

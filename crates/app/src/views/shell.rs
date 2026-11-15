@@ -609,6 +609,7 @@ impl Render for Shell {
                 })
             })
             .children(crate::components::connection_banner::render(&self.state, cx))
+            .children(crate::components::update_banner::render(&self.state, cx))
             .children(crate::components::notifications::render(&self.state, cx))
             .children(crate::components::scale_preview::render(&self.state, cx))
             .children(crate::views::dialogs::render(&self.state, &self.dialog_inputs, cx))

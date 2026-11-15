@@ -178,3 +178,13 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
+
+/// Lyrics from a sidecar file next to a local track: `Song.flac` ->
+/// `Song.lrc` (or `.LRC`). Parsed as TTML, LRC or plain text, like a
+/// clipboard import.
+pub fn sidecar_lyrics(audio_path: &str) -> Option<volta_logic::lyrics::Lyrics> {
+    let path = Path::new(audio_path);
+    let bytes = ["lrc", "LRC"].iter().find_map(|ext| std::fs::read(path.with_extension(ext)).ok())?;
+    let text = String::from_utf8_lossy(&bytes);
+    volta_logic::lyrics::parse_lyrics_text(text.trim_start_matches('\u{feff}'))
+}

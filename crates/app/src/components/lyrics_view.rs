@@ -110,13 +110,25 @@ impl LyricsView {
             self.pending = false;
             return;
         }
+        // Local tracks: a `.lrc` file next to the audio wins.
+        if let Some(lyrics) = song
+            .as_ref()
+            .filter(|s| s.is_local())
+            .and_then(|s| s.local_file_path.as_deref().or(s.local_path.as_deref()))
+            .and_then(volta_services::local::sidecar_lyrics)
+        {
+            self.lyrics = Some(lyrics);
+            self.pending = false;
+            self._fetch = None;
+            return;
+        }
         let (Some(song), Some(client)) = (song, client) else {
             self.pending = false;
             self._fetch = None;
             return;
         };
         let external = self.state.read(cx).storage.get(volta_logic::storage::EXTERNAL_LYRICS_KEY) == "true";
-        // Local files have no server to ask: clipboard import, or LRCLIB
+        // Local files have no server to ask: a sidecar .lrc, clipboard import, or LRCLIB
         // when external lookup is on.
         let local = song.is_local();
         if local && !external {
