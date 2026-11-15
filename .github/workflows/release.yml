@@ -85,6 +85,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # vendor/ path crates are implicit workspace members, which rust-cache
+          # drops from the cache by default; keep them so the pinned mtimes pay off.
+          cache-workspace-crates: true
 
       - name: Linux build dependencies
         if: runner.os == 'Linux'
