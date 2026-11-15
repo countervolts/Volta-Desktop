@@ -7,7 +7,7 @@
 
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -15,6 +15,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use rtrb::{Consumer, Producer, RingBuffer};
 use rubato::{FftFixedInOut, Resampler};
 use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
+use symphonia::core::codecs::registry::CodecRegistry;
 use symphonia::core::errors::Error as SymError;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
@@ -105,6 +106,17 @@ fn open_source(request: &DecodeRequest, client: &reqwest::blocking::Client) -> R
     }
 }
 
+/// Symphonia's own decoders plus Opus, which symphonia lacks (libopus adapter).
+fn codecs() -> &'static CodecRegistry {
+    static REGISTRY: OnceLock<CodecRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let mut registry = CodecRegistry::new();
+        symphonia::default::register_enabled_codecs(&mut registry);
+        registry.register_audio_decoder::<symphonia_adapter_libopus::OpusDecoder>();
+        registry
+    })
+}
+
 /// A file's length from its container header (no decoding): FLAC
 /// STREAMINFO, MP4 `mdhd`, Xing/VBRI or a CBR estimate for MP3, and so on.
 pub fn probe_duration(path: &std::path::Path) -> Option<f64> {
@@ -146,7 +158,7 @@ impl Pipeline {
                 .map(|t| t.as_secs_f64()),
             _ => None,
         };
-        let decoder = symphonia::default::get_codecs()
+        let decoder = codecs()
             .make_audio_decoder(params, &AudioDecoderOptions::default())
             .map_err(|e| format!("unsupported codec: {e}"))?;
         let track_id = track.id;

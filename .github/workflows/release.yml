@@ -72,7 +72,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config libasound2-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
-            libxcb1-dev libx11-xcb-dev libvulkan-dev libfontconfig-dev libfreetype-dev
+            libxcb1-dev libx11-xcb-dev libvulkan-dev libfontconfig-dev libfreetype-dev \
+            cmake libclang-dev
 
       - name: Build
         run: cargo build --release --locked -p volta
