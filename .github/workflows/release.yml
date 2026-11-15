@@ -99,7 +99,8 @@ jobs:
       - name: Package (macOS)
         if: runner.os == 'macOS'
         run: |
-          cargo install cargo-bundle --locked
+          # rust-cache saves ~/.cargo/bin, so after the first run this is already installed.
+          command -v cargo-bundle >/dev/null || cargo install cargo-bundle --locked
           (cd crates/app && cargo bundle --release)
           mkdir -p dist
           ditto -c -k --keepParent target/release/bundle/osx/Volta.app "dist/volta-${GITHUB_REF_NAME}-${{ matrix.name }}.zip"
