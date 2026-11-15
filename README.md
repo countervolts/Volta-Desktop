@@ -7,7 +7,7 @@
 **A native desktop music player for Navidrome and local music. Rust and gpui, no Electron or webview.**
 
 ![Built with](https://img.shields.io/badge/built%20with-Rust%20%C2%B7%20gpui-orange)
-![Platform](https://img.shields.io/badge/platform-Linux-black)
+![Platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux-black)
 ![Servers](https://img.shields.io/badge/servers-Navidrome%20%C2%B7%20Subsonic-blue)
 
 </div>
