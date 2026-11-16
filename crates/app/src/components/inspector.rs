@@ -117,6 +117,48 @@ fn queue(state: &Entity<AppState>, cx: &mut App) -> AnyElement {
         );
     }
 
+    // Up Next AutoMix button (per queue) and why the coming transition is
+    // what it is.
+    let (automix_mode, automix_on, status) = {
+        let p = player_entity.read(cx);
+        let next = index.map(|i| i + 1);
+        let status = p.mix_status.clone().filter(|(i, _)| Some(*i) == next || (*i == 0 && next == Some(queue.len()))).map(|(_, t)| t);
+        (p.transition == crate::player::Transition::Automix, p.automix_queue, status)
+    };
+    if automix_mode && current.is_some() {
+        let toggle_player = player_entity.clone();
+        content = content.child(
+            div()
+                .mt(sz(18.0))
+                .flex()
+                .items_center()
+                .gap(sz(10.0))
+                .child(
+                    div()
+                        .id("queue-automix")
+                        .flex_none()
+                        .px(sz(10.0))
+                        .py(sz(4.0))
+                        .rounded(sz(12.0))
+                        .border(sz(1.0))
+                        .border_color(if automix_on { tokens.accent } else { tokens.line })
+                        .when(automix_on, |d| d.bg(tokens.accent).text_color(gpui::white()))
+                        .text_size(sz(11.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .cursor_pointer()
+                        .on_click(move |_, _, cx| toggle_player.update(cx, |p, cx| p.set_automix_queue(!automix_on, cx)))
+                        .child("AutoMix"),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .text_size(sz(11.0))
+                        .text_color(tokens.secondary)
+                        .child(if automix_on { status.unwrap_or_else(|| "Next transition is planned near the end of the song".into()) } else { "Songs play without transitions in this queue".into() }),
+                ),
+        );
+    }
+
     let clear_player = player_entity.clone();
     content = content.child(
         div()

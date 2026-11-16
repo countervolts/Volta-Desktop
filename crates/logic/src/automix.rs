@@ -2,7 +2,7 @@
 //! beat-matched branch) or server tempo/key tags.
 
 use crate::audio_analysis::TrackAnalysis;
-use crate::model::{Song, Source};
+use crate::model::Song;
 use crate::musical_key::{camelot_distance, harmonic_compatibility, parse_musical_key, tempo_compatibility};
 
 pub const AUTOMIX_MAX_OVERLAP: f64 = 8.0;
@@ -165,9 +165,11 @@ pub fn is_album_sequence(queue: &[&Song]) -> bool {
     true
 }
 
-/// `automixEligible`.
-pub fn automix_eligible(queue: &[&Song]) -> bool {
-    queue.len() >= 2 && !queue.iter().any(|s| s.source == Some(Source::Local)) && !is_album_sequence(queue)
+/// `automixEligible`. Local files qualify: the native app profiles them from
+/// disk, so they are mixed like any other song. With `mix_albums` off, an
+/// album played in track order keeps its natural boundaries.
+pub fn automix_eligible(queue: &[&Song], mix_albums: bool) -> bool {
+    queue.len() >= 2 && (mix_albums || !is_album_sequence(queue))
 }
 
 /// `describeAutomixStyle`.
@@ -183,6 +185,7 @@ pub fn describe_automix_style(style: AutomixStyle) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Source;
 
     fn song(id: &str, album: &str, track: f64, duration: f64) -> Song {
         Song { id: id.into(), album_id: Some(album.into()), track: Some(track), duration: Some(duration), ..Default::default() }
@@ -194,9 +197,13 @@ mod tests {
         let plan = plan_automix_transition(&a, None, &b, None, None);
         assert_eq!(plan.style, AutomixStyle::Crossfade);
         assert_eq!(plan.overlap_seconds, 2.0);
-        assert!(automix_eligible(&[&a, &b]));
+        assert!(automix_eligible(&[&a, &b], false));
         let c = song("c", "x", 2.0, 200.0);
-        assert!(!automix_eligible(&[&a, &c]));
+        assert!(!automix_eligible(&[&a, &c], false));
+        assert!(automix_eligible(&[&a, &c], true), "mixing albums is opt-in");
+        // Local files are profiled from disk, so they mix like any other song.
+        let local = Song { source: Some(Source::Local), ..song("l", "w", 1.0, 200.0) };
+        assert!(automix_eligible(&[&a, &local], false));
         let short = song("s", "z", 1.0, 10.0);
         assert_eq!(plan_automix_transition(&a, None, &short, None, None).style, AutomixStyle::Gapless);
     }

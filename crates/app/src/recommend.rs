@@ -648,7 +648,23 @@ impl AppState {
             _ if seconds > 0.0 => crate::player::Transition::Crossfade(seconds.max(1.0)),
             _ => crate::player::Transition::Off,
         };
-        self.player.update(cx, |p, _| p.set_transition(mode));
+        let mix_albums = self.storage.get(keys::AUTOMIX_ALBUMS_KEY) != "false";
+        // Fitted planner thresholds (from the measurement lab), if present.
+        let planner = volta_services::storage::data_dir()
+            .and_then(|dir| std::fs::read_to_string(dir.join("automix-planner.json")).ok())
+            .and_then(|text| match volta_logic::mix_planner::PlannerConfig::from_json(&text) {
+                Ok(config) => Some(config),
+                Err(error) => {
+                    log::warn!("automix-planner.json ignored: {error}");
+                    None
+                }
+            })
+            .unwrap_or_default();
+        self.player.update(cx, |p, _| {
+            p.mix_albums = mix_albums;
+            p.planner = planner;
+            p.set_transition(mode);
+        });
     }
 
 }

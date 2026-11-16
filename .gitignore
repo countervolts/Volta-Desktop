@@ -13,3 +13,6 @@
 .vscode/
 *.log
 *.profraw
+
+# Private research and notes (never committed)
+/private/

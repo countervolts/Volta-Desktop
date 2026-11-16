@@ -28,6 +28,8 @@ pub const CROSSFADE_KEY: &str = "volta-crossfade-seconds";
 pub const VOLUME_SCROLL_STEP_KEY: &str = "volta-volume-scroll-step";
 pub const VOLUME_SHIFT_SCROLL_STEP_KEY: &str = "volta-volume-shift-scroll-step";
 pub const TRANSITION_MODE_KEY: &str = "volta-transition-mode";
+/// Native-only: "false" keeps albums played in order gapless under AutoMix (default: mix them).
+pub const AUTOMIX_ALBUMS_KEY: &str = "volta-automix-albums";
 pub const NORMALIZATION_KEY: &str = "volta-normalization";
 pub const PINS_KEY: &str = "volta-pins";
 pub const ACCOUNTS_KEY: &str = "volta-accounts";

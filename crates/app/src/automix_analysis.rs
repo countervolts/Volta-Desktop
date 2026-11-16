@@ -1,8 +1,9 @@
-//! Background analysis for the native AutoMix: the whole current track and
-//! the next two are decoded and profiled (beats, downbeats, key, loudness,
-//! audible span) one at a time. Profiles are stored per track under
-//! `volta-mix-profile:v3:<hash>` with a 600-entry LRU index. Local files are
-//! analysed from disk too.
+//! Background analysis for the native AutoMix: the next song (it decides the
+//! coming transition) is profiled first, then the current one, then the two
+//! after (beats, downbeats, key, loudness, audible span, sections, fades),
+//! one at a time. Profiles are stored per track under
+//! `volta-mix-profile:v4:<hash>` with a 600-entry LRU index; the v3 cache is
+//! removed once. Local files are analysed from disk too.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -15,7 +16,9 @@ use volta_logic::model::Song;
 use crate::app_state::AppState;
 use crate::player::Transition;
 
-const INDEX_KEY: &str = "volta-mix-profile:v3:index";
+const INDEX_KEY: &str = "volta-mix-profile:v4:index";
+/// The previous format's index; its entries are deleted once.
+const OLD_INDEX_KEY: &str = "volta-mix-profile:v3:index";
 const CACHE_LIMIT: usize = 600;
 const MAX_ANALYSIS_BYTES: f64 = 256.0 * 1024.0 * 1024.0;
 
@@ -47,15 +50,15 @@ pub fn analysis_key(server: &str, username: &str, song: &Song, original: bool) -
 
 fn storage_key(key: &str) -> String {
     let hash = key.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100000001b3));
-    format!("volta-mix-profile:v3:{hash:016x}")
+    format!("volta-mix-profile:v4:{hash:016x}")
 }
 
 impl AppState {
-    fn read_profile(&self, key: &str) -> Option<MixProfile> {
+    pub(crate) fn read_profile(&self, key: &str) -> Option<MixProfile> {
         serde_json::from_str::<MixProfile>(&self.storage.get(&storage_key(key))).ok().filter(|p| p.version == PROFILE_VERSION && p.bpm > 0.0)
     }
 
-    fn store_profile(&mut self, key: String, profile: MixProfile, cx: &mut Context<Self>) {
+    pub(crate) fn store_profile(&mut self, key: String, profile: MixProfile, cx: &mut Context<Self>) {
         let slot = storage_key(&key);
         self.storage.set(&slot, &serde_json::to_string(&profile).unwrap_or_default());
         let mut index: Vec<(String, f64)> = serde_json::from_str(&self.storage.get(INDEX_KEY)).unwrap_or_default();
@@ -71,7 +74,21 @@ impl AppState {
         });
     }
 
-    /// Profiles the current track and the next two while AutoMix is on.
+    /// Deletes v3 profiles (their format is superseded) the first time.
+    fn purge_old_profiles(&mut self) {
+        let old = self.storage.get(OLD_INDEX_KEY);
+        if old.is_empty() {
+            return;
+        }
+        let index: Vec<(String, f64)> = serde_json::from_str(&old).unwrap_or_default();
+        for (slot, _) in index {
+            self.storage.remove(&slot);
+        }
+        self.storage.remove(OLD_INDEX_KEY);
+    }
+
+    /// Profiles the next track, the current one and the two after while
+    /// AutoMix is on. The next one comes first: it decides the coming seam.
     pub fn prime_automix_analysis(&mut self, cx: &mut Context<Self>) {
         let player = self.player.read(cx);
         if player.transition != Transition::Automix {
@@ -80,8 +97,10 @@ impl AppState {
         let Some(index) = player.index else { return };
         let (server, username) = self.client().map(|c| (c.server.clone(), c.username.clone())).unwrap_or_default();
         let original = player.original;
+        let order = [index + 1, index, index + 2, index + 3];
         let wanted: Vec<(String, Song)> =
-            player.queue.iter().skip(index).take(3).map(|s| (analysis_key(&server, &username, s, original), s.clone())).collect();
+            order.iter().filter_map(|&i| player.queue.get(i)).map(|s| (analysis_key(&server, &username, s, original), s.clone())).collect();
+        self.purge_old_profiles();
         let signature = wanted.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join("|");
         if signature == self.analyzer.signature {
             return;

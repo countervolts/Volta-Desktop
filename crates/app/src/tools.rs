@@ -4,6 +4,7 @@
 
 use gpui::{AnyWindowHandle, App, AppContext, Bounds, Entity, Global, Render, TitlebarOptions, Window, WindowBounds, WindowOptions, px, size};
 
+use crate::components::automix_preview::AutomixPreview;
 use crate::components::console_window::ConsoleView;
 use crate::components::perf_overlay::{PerfOverlay, SharedFeed};
 use crate::app_state::AppState;
@@ -12,6 +13,7 @@ use crate::app_state::AppState;
 struct ToolWindows {
     performance: Option<AnyWindowHandle>,
     console: Option<AnyWindowHandle>,
+    automix: Option<AnyWindowHandle>,
     /// The player window, whose frames the performance window reports.
     main: Option<AnyWindowHandle>,
     /// Frame samples of the main window, filled while the performance window is open.
@@ -99,6 +101,14 @@ pub fn open_performance(state: &Entity<AppState>, cx: &mut App) {
 /// The log console.
 pub fn open_console(cx: &mut App) {
     open(cx, |t| &mut t.console, "Volta Console", (820.0, 520.0), |_, cx| cx.new(ConsoleView::new));
+}
+
+/// Two random library songs and the AutoMix join between them, playable.
+pub fn open_automix_preview(state: &Entity<AppState>, cx: &mut App) {
+    let target = state.clone();
+    open(cx, |t| &mut t.automix, "Volta AutoMix Preview", (460.0, 720.0), move |_, cx| {
+        cx.new(|cx| AutomixPreview::new(target, cx))
+    });
 }
 
 /// Closes every tool window (they belong to the main window).

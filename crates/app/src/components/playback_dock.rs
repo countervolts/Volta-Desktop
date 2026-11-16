@@ -355,6 +355,12 @@ impl Render for PlaybackDock {
         let wide = viewport > 860.0 && !inspector_compact;
 
         let mixing = self.state.read(cx).player.read(cx).automix_label.is_some();
+        // During a mix the incoming cover dissolves in over the current one.
+        let morph = {
+            let player = self.state.read(cx).player.read(cx);
+            player.mix_progress().zip(player.mixing_into().map(|s| s.cover_art.clone()))
+        };
+        let morph = morph.and_then(|(progress, id)| self.state.update(cx, |state, cx| state.cover(id.as_deref(), 100, cx)).map(|image| (image, progress)));
         let title = song.as_ref().map(|s| s.title.clone()).unwrap_or_else(|| "Volta".into());
         let subtitle = match &song {
             Some(s) => {
@@ -391,7 +397,11 @@ impl Render for PlaybackDock {
             .items_center()
             .justify_center()
             .text_color(tokens.muted)
+            .relative()
             .when_some(cover, |a, image| a.child(img(image).size_full().rounded(sz(art_radius))))
+            .when_some(morph, |a, (image, progress)| {
+                a.child(img(image).absolute().top_0().left_0().size_full().rounded(sz(art_radius)).opacity(progress.clamp(0.0, 1.0)))
+            })
             // `filter: blur(3px); opacity: .55` while seeking.
             .when(reveal > 0.0, |a| a.opacity(1.0 - 0.45 * reveal).filter_blur(sz(3.0 * reveal)));
 

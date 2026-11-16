@@ -3,13 +3,17 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, select, tick, unbounded};
 
 use crate::decoder::{self, DecodeRequest, DecoderCtrl, DecoderMsg, TrackSource};
 use crate::output::{self, CallbackCmd, DECKS, Output, Shared};
 use crate::{Command, Event, LoadRequest};
+
+/// How long playback stays paused before the device stream is suspended, so
+/// the OS stops showing the app as an active audio source.
+const IDLE_SUSPEND: Duration = Duration::from_millis(1500);
 
 #[derive(Default)]
 struct Deck {
@@ -37,6 +41,10 @@ pub(crate) struct Engine {
     seen_ended: u64,
     /// A blend command is in flight or mixing.
     blending: bool,
+    /// The device stream is suspended (callback not running).
+    suspended: bool,
+    /// Last time playback or a command touched the output.
+    last_activity: Instant,
     decoder_tx: Sender<DecoderMsg>,
     decoder_rx: Receiver<DecoderMsg>,
     events: Sender<Event>,
@@ -56,6 +64,8 @@ impl Engine {
             seen_advance: 0,
             seen_ended: 0,
             blending: false,
+            suspended: false,
+            last_activity: Instant::now(),
             decoder_tx,
             decoder_rx,
             events,
@@ -84,7 +94,35 @@ impl Engine {
         }
     }
 
+    /// Marks the output busy and wakes a suspended stream so the callback can
+    /// apply queued commands.
+    fn wake(&mut self) {
+        self.last_activity = Instant::now();
+        if self.suspended {
+            self.suspended = false;
+            if let Some(output) = self.output.as_ref() {
+                output.resume();
+            }
+        }
+    }
+
+    fn suspend_if_idle(&mut self) {
+        if self.suspended || self.playing || self.last_activity.elapsed() < IDLE_SUSPEND {
+            return;
+        }
+        // Never suspend while the callback is still mixing (e.g. a blend).
+        if self.shared.playing.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(output) = self.output.as_ref() {
+            self.suspended = output.suspend();
+            // Don't retry every tick if the backend refuses.
+            self.last_activity = Instant::now();
+        }
+    }
+
     fn send(&mut self, command: CallbackCmd) {
+        self.wake();
         if let Some(output) = self.output.as_mut()
             && output.commands.push(command).is_err() {
                 log::warn!("audio command queue full");
@@ -245,6 +283,7 @@ impl Engine {
         // Free rings the callback has retired.
         if let Some(output) = self.output.as_mut() {
             while output.trash.pop().is_ok() {}
+            while output.retired.pop().is_ok() {}
         }
         let advance = self.shared.advance_count.load(Ordering::Acquire);
         if advance != self.seen_advance {
@@ -275,6 +314,7 @@ impl Engine {
         if self.shared.stream_failed.swap(false, Ordering::AcqRel) {
             self.rebuild_output();
         }
+        self.suspend_if_idle();
     }
 
     /// Output device changed or vanished: reopen and resume where we were.
@@ -290,6 +330,7 @@ impl Engine {
             self.stop_deck(index);
         }
         self.output = None;
+        self.suspended = false;
         self.active = 0;
         if let Some(mut request) = current {
             request.start_at = position;
@@ -326,18 +367,17 @@ impl Engine {
                 let deck = &self.decks[other];
                 if !self.blending && deck.preload && deck.ready && deck.token == request.token && self.decks[self.active].ready {
                     let rate = f64::from(self.shared.sample_rate.load(Ordering::Relaxed).max(1));
-                    let base = f64::from_bits(self.shared.deck_base[self.active].load(Ordering::Acquire));
+                    let out_base = f64::from_bits(self.shared.deck_base[self.active].load(Ordering::Acquire));
+                    let in_base = deck.request.as_ref().map_or(0.0, |r| r.start_at);
                     self.blending = true;
-                    self.send(CallbackCmd::Blend(crate::output::BlendSpec {
-                        deck: other,
-                        frames: (request.seconds.max(0.01) * rate) as u64,
-                        linear: request.curve == crate::BlendCurve::Linear,
-                        start_frame: request.start_at.map(|t| ((t - base).max(0.0) * rate) as u64),
-                        tempo: request.tempo.clamp(0.5, 2.0),
-                        release: (request.release_seconds.max(0.0) * rate) as u64,
-                        bass_swap: request.bass_swap,
-                        gain_start: 10f64.powf(request.gain_db / 20.0) as f32,
-                    }));
+                    let spec = crate::output::TransitionSpec::new(other, request.seconds, request.start_at, request.automation, out_base, in_base, rate);
+                    self.send(CallbackCmd::Blend(Box::new(spec)));
+                }
+            }
+            Command::FinishBlend { seconds } => {
+                if self.blending {
+                    let rate = f64::from(self.shared.sample_rate.load(Ordering::Relaxed).max(1));
+                    self.send(CallbackCmd::FinishBlend { frames: (seconds.max(0.01) * rate) as u64 });
                 }
             }
             Command::CancelBlend => {}

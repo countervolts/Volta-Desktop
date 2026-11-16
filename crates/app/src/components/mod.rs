@@ -1,4 +1,5 @@
 pub mod album_grid;
+pub mod automix_preview;
 pub mod charts;
 pub mod connection_banner;
 pub mod console_window;

@@ -126,6 +126,12 @@ impl Render for FullPlayer {
 
         let p = self.player.clone();
         let mixing = self.state.read(cx).player.read(cx).automix_label.is_some();
+        // During a mix the incoming cover dissolves in over the current one.
+        let morph = {
+            let player = self.state.read(cx).player.read(cx);
+            player.mix_progress().zip(player.mixing_into().map(|s| s.cover_art.clone()))
+        };
+        let morph = morph.and_then(|(progress, id)| self.state.update(cx, |state, cx| state.cover(id.as_deref(), 900, cx)).map(|image| (image, progress)));
         let favorite = self.state.read(cx).is_favorite_song(&song);
         let (fav_state, fav_song) = (self.state.clone(), song.clone());
         let button = |id: &'static str, label: String, child: gpui::AnyElement| {
@@ -380,7 +386,11 @@ impl Render for FullPlayer {
                         spread_radius: px(0.0),
                         inset: false,
                     }])
-                    .when_some(cover, |d, image| d.child(img(image).size_full().rounded(sz(9.0)))),
+                    .relative()
+                    .when_some(cover, |d, image| d.child(img(image).size_full().rounded(sz(9.0))))
+                    .when_some(morph, |d, (image, progress)| {
+                        d.child(img(image).absolute().top_0().left_0().size_full().rounded(sz(9.0)).opacity(progress.clamp(0.0, 1.0)))
+                    }),
             )
             .child(
                 div()

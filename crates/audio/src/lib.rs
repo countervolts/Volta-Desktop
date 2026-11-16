@@ -11,8 +11,10 @@
 //! (Crossfade, AutoMix) mixes both decks in the callback, then switches.
 
 mod decoder;
+pub mod dsp;
 mod engine;
 mod http_source;
+pub mod offline;
 mod output;
 pub mod stretch;
 
@@ -21,7 +23,8 @@ use std::sync::atomic::Ordering;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
-pub use decoder::{AnalysisClip, TrackSource, decode_for_analysis, decode_mono_11k, probe_duration};
+pub use decoder::{AnalysisClip, TrackSource, decode_for_analysis, decode_mono_11k, decode_stereo, probe_duration};
+pub use volta_logic::mix_automation::{DeckAutomation, Envelope, LoopRegion, Shape, TransitionAutomation};
 pub use http_source::http_client;
 
 /// A track to open on a deck.
@@ -53,13 +56,16 @@ pub enum Command {
     /// Effective master volume, 0..1 (0 when muted).
     SetVolume(f32),
     SetDeckGain { token: u64, gain: f32 },
-    /// Crossfade into the preloaded track `token` over `seconds`: both decks
-    /// play, mixed sample by sample with `curve`, then the callback switches
-    /// to the incoming deck and reports [`Event::Advanced`]. Ignored unless
-    /// that track is preloaded and decoded.
+    /// Mix into the preloaded track `token`: both decks play, each shaped by
+    /// the request's automation (gain, bands, filters, tempo, loops), then
+    /// the callback switches to the incoming deck and reports
+    /// [`Event::Advanced`]. Ignored unless that track is preloaded and decoded.
     Blend(BlendRequest),
     /// Abandon a running blend; the incoming track is preloaded again.
     CancelBlend,
+    /// Finish a running blend within `seconds` (a skip during a mix). A blend
+    /// that has not started yet is cancelled instead.
+    FinishBlend { seconds: f64 },
     Stop,
     Shutdown,
 }
@@ -68,25 +74,11 @@ pub enum Command {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BlendRequest {
     pub token: u64,
-    /// Blend length in seconds of outgoing time.
+    /// Overlap length in seconds of output time.
     pub seconds: f64,
-    pub curve: BlendCurve,
     /// Outgoing track time at which to start (sample-accurate); `None` = now.
     pub start_at: Option<f64>,
-    /// Incoming playback rate during the blend (pitch preserved).
-    pub tempo: f64,
-    /// Seconds for the incoming rate to ease back to 1 afterwards.
-    pub release_seconds: f64,
-    pub bass_swap: bool,
-    /// Incoming level change at the blend start, eased out by its end.
-    pub gain_db: f64,
-}
-
-/// Blend gain curve: equal-power (cos/sin) or linear.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlendCurve {
-    EqualPower,
-    Linear,
+    pub automation: TransitionAutomation,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +146,11 @@ impl AudioHandle {
     /// A crossfade is mixing both decks.
     pub fn is_blending(&self) -> bool {
         self.shared.blending.load(Ordering::Acquire)
+    }
+
+    /// Progress 0–1 of the running blend.
+    pub fn blend_progress(&self) -> f32 {
+        f32::from_bits(self.shared.blend_progress.load(Ordering::Relaxed))
     }
 
     pub fn underruns(&self) -> u64 {

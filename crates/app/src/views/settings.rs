@@ -191,7 +191,7 @@ fn pref(state: &Entity<AppState>, key: &str, cx: &App) -> String {
 fn set_pref(state: &Entity<AppState>, key: &str, value: &str, cx: &mut App) {
     state.update(cx, |s, cx| {
         s.storage.set(key, value);
-        if key == keys::TRANSITION_MODE_KEY || key == keys::CROSSFADE_KEY {
+        if key == keys::TRANSITION_MODE_KEY || key == keys::CROSSFADE_KEY || key == keys::AUTOMIX_ALBUMS_KEY {
             s.sync_transition(cx);
         }
         // Turning tracking off empties the profile; turning it on reads it back.
@@ -497,6 +497,20 @@ fn playback(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyEleme
             transition_select.into_any_element(),
         ),
     ];
+    if transition == "automix" {
+        let albums_state = state.clone();
+        let mix_albums = pref(state, keys::AUTOMIX_ALBUMS_KEY, cx) != "false";
+        rows.push(row(
+            tokens,
+            "purple",
+            "audio-lines",
+            "Mix albums too",
+            "Blend albums played in track order as well. Turn this off to keep an album gapless from start to finish.",
+            checkbox("automix-albums", mix_albums, tokens, move |v, cx| {
+                set_pref(&albums_state, keys::AUTOMIX_ALBUMS_KEY, if v { "true" } else { "false" }, cx)
+            }),
+        ));
+    }
     if transition == "crossfade" {
         rows.push(row(
             tokens,
@@ -690,11 +704,21 @@ fn privacy(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyElemen
 /// Developer options, offered in every build on every OS.
 fn developer(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyElement {
     let console_at_startup = pref(state, keys::CONSOLE_AT_STARTUP_KEY, cx) == "true";
-    let (open_state, toggle_state) = (state.clone(), state.clone());
+    let (open_state, toggle_state, mix_state) = (state.clone(), state.clone(), state.clone());
     section(
         tokens,
         "Developer",
         vec![
+            row(
+                tokens,
+                "purple",
+                "audio-lines",
+                "AutoMix preview",
+                "Pick two random songs from your library and hear the AutoMix transition between them, with the blend point, length, tempo and bass swap shown. Pick new songs or listen again.",
+                secondary_button("open-automix-preview", "Open preview", "", cx)
+                    .on_click(move |_, _, cx| crate::tools::open_automix_preview(&mix_state, cx))
+                    .into_any_element(),
+            ),
             row(
                 tokens,
                 "orange",

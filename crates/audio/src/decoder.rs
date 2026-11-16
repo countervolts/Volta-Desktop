@@ -606,3 +606,32 @@ pub fn decode_mono_11k(source: &TrackSource, extension: Option<&str>, client: &r
     }
     (!mono.is_empty()).then_some(mono)
 }
+
+/// The whole track as interleaved stereo at `rate` (offline rendering, the
+/// measurement lab, WAV export). `None` past 15 minutes.
+pub fn decode_stereo(source: &TrackSource, extension: Option<&str>, rate: u32, client: &reqwest::blocking::Client) -> Option<Vec<f32>> {
+    let request = DecodeRequest {
+        deck: 0,
+        generation: 0,
+        source: source.clone(),
+        hint_extension: extension.map(str::to_string),
+        start_at: 0.0,
+        device_rate: rate,
+    };
+    let media = open_source(&request, client).ok()?;
+    let (mut pipeline, _) = Pipeline::open(media, extension, rate).ok()?;
+    let limit = (ANALYSIS_MAX_SECONDS * f64::from(rate)) as usize * 2;
+    let mut out = Vec::new();
+    let mut chunk = Vec::new();
+    loop {
+        let more = pipeline.next(&mut chunk).ok()?;
+        out.extend_from_slice(&chunk);
+        if out.len() > limit {
+            return None;
+        }
+        if !more {
+            break;
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}

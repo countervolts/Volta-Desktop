@@ -1,6 +1,6 @@
-//! Pitch-preserving time-stretch (WSOLA) for the realtime mixer, plus the
-//! low-band filter used for bass swaps. Everything is preallocated: nothing
-//! here allocates once constructed, so it is safe on the audio thread.
+//! Pitch-preserving time-stretch (WSOLA) for the realtime mixer. Everything
+//! is preallocated: nothing here allocates once constructed, so it is safe
+//! on the audio thread.
 //!
 //! WSOLA: output is built from Hann-windowed input segments overlap-added at
 //! a fixed synthesis hop. Each segment's input position advances by
@@ -13,6 +13,8 @@
 pub const WINDOW: usize = 2048;
 pub const HOP: usize = WINDOW / 2;
 const SEARCH: usize = 384;
+/// Correlation given up per (offset / SEARCH)² away from the nominal position.
+const DRIFT_PENALTY: f32 = 2.0;
 const CAPACITY: usize = WINDOW * 8 + 2 * SEARCH;
 
 pub struct Stretcher {
@@ -31,6 +33,8 @@ pub struct Stretcher {
     out_len: usize,
     /// Frames of zero padding added after the input ended.
     padded: bool,
+    /// Output frames still to drop (the primed history).
+    discard: usize,
     pub active: bool,
 }
 
@@ -49,6 +53,7 @@ impl Stretcher {
             out_read: 0,
             out_len: 0,
             padded: false,
+            discard: 0,
             active: false,
         }
     }
@@ -64,7 +69,21 @@ impl Stretcher {
         self.out_read = 0;
         self.out_len = 0;
         self.padded = false;
+        self.discard = 0;
         self.active = true;
+    }
+
+    /// Starts stretching at `at` mid-stream without a dip: `history` holds
+    /// the frames just before `at` (oldest first, ideally [`HOP`] of them).
+    /// They seed the overlap-add, and the output they produce is dropped, so
+    /// at rate 1 the output continues the input sample for sample.
+    pub fn engage_primed(&mut self, at: u64, history: &[[f32; 2]]) {
+        let h = history.len().min(HOP).min(at as usize);
+        self.engage(at - h as u64);
+        for frame in &history[history.len() - h..] {
+            self.push(*frame);
+        }
+        self.discard = h;
     }
 
     pub fn reset(&mut self) {
@@ -80,10 +99,20 @@ impl Stretcher {
     }
 
     pub fn pop(&mut self) -> Option<[f32; 2]> {
-        (self.out_read < self.out_len).then(|| {
+        while self.out_read < self.out_len {
             self.out_read += 1;
-            self.out[self.out_read - 1]
-        })
+            if self.discard > 0 {
+                self.discard -= 1;
+                continue;
+            }
+            return Some(self.out[self.out_read - 1]);
+        }
+        None
+    }
+
+    /// Input frames pushed but not yet played (nominally).
+    pub fn buffered(&self) -> u64 {
+        self.input_end().saturating_sub(self.position.max(0.0) as u64)
     }
 
     fn input_end(&self) -> u64 {
@@ -139,17 +168,34 @@ impl Stretcher {
                 let target = previous + HOP as u64;
                 let low = nominal.saturating_sub(SEARCH as u64).max(self.input_base);
                 let high = nominal + SEARCH as u64;
+                // Normalised so loud and quiet candidates compare fairly, and
+                // pulled toward the nominal position: without the pull the
+                // search keeps choosing the natural continuation and the
+                // output drifts to the edge of the search range (a steady
+                // timing error of up to SEARCH frames at rates ≠ 1).
                 let (mut best, mut best_score) = (nominal, f32::NEG_INFINITY);
+                let mut target_energy = 0f32;
+                let mut i = 0;
+                while i < WINDOW {
+                    let a = self.at(target + i as u64);
+                    target_energy += (a[0] + a[1]) * (a[0] + a[1]);
+                    i += 8;
+                }
                 let mut candidate = low;
                 while candidate <= high {
-                    let mut score = 0f32;
+                    let (mut dot, mut energy) = (0f32, 0f32);
                     let mut i = 0;
                     while i < WINDOW {
                         let a = self.at(target + i as u64);
                         let b = self.at(candidate + i as u64);
-                        score += (a[0] + a[1]) * (b[0] + b[1]);
+                        let (ma, mb) = (a[0] + a[1], b[0] + b[1]);
+                        dot += ma * mb;
+                        energy += mb * mb;
                         i += 8;
                     }
+                    let corr = dot / (target_energy * energy).sqrt().max(1e-9);
+                    let distance = (candidate as f32 - nominal as f32) / SEARCH as f32;
+                    let score = corr - DRIFT_PENALTY * distance * distance;
                     if score > best_score {
                         best_score = score;
                         best = candidate;
@@ -188,50 +234,6 @@ impl Stretcher {
 impl Default for Stretcher {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// A 2nd-order high-pass (RBJ, Q 0.707) per channel; `cut` blends from dry
-/// to filtered, removing the low band.
-#[derive(Clone, Copy, Default)]
-pub struct LowCut {
-    b0: f32,
-    b1: f32,
-    b2: f32,
-    a1: f32,
-    a2: f32,
-    state: [[f32; 4]; 2],
-}
-
-impl LowCut {
-    pub fn new(frequency: f32, sample_rate: f32) -> Self {
-        let w = 2.0 * std::f32::consts::PI * frequency / sample_rate;
-        let (sin, cos) = w.sin_cos();
-        let alpha = sin / (2.0 * std::f32::consts::FRAC_1_SQRT_2);
-        let a0 = 1.0 + alpha;
-        Self {
-            b0: (1.0 + cos) / 2.0 / a0,
-            b1: -(1.0 + cos) / a0,
-            b2: (1.0 + cos) / 2.0 / a0,
-            a1: -2.0 * cos / a0,
-            a2: (1.0 - alpha) / a0,
-            state: [[0.0; 4]; 2],
-        }
-    }
-
-    /// `x + cut × (highpass(x) − x)` per channel.
-    pub fn process(&mut self, frame: [f32; 2], cut: f32) -> [f32; 2] {
-        let mut out = frame;
-        for (channel, x) in frame.iter().enumerate() {
-            let s = &mut self.state[channel];
-            let y = self.b0 * x + self.b1 * s[0] + self.b2 * s[1] - self.a1 * s[2] - self.a2 * s[3];
-            s[1] = s[0];
-            s[0] = *x;
-            s[3] = s[2];
-            s[2] = y;
-            out[channel] = x + cut * (y - x);
-        }
-        out
     }
 }
 
@@ -291,30 +293,48 @@ mod tests {
     }
 
     #[test]
-    fn low_cut_removes_bass_but_keeps_treble() {
-        let rate = 48000.0;
-        let mut cut = LowCut::new(180.0, rate);
-        let (mut bass, mut treble) = (0f32, 0f32);
-        for i in 0..48000 {
-            let t = i as f32 / rate;
-            let low = (2.0 * std::f32::consts::PI * 50.0 * t).sin();
-            let high = (2.0 * std::f32::consts::PI * 4000.0 * t).sin();
-            if i > 4800 {
-                bass += cut.process([low, low], 1.0)[0].abs();
-            } else {
-                cut.process([low, low], 1.0);
-            }
-            let _ = high;
+    fn primed_engage_is_seamless_mid_stream() {
+        let input: Vec<f32> = (0..30_000).map(|i| (i as f32 * 0.031).sin() * 0.5).collect();
+        let at = 10_000usize;
+        let history: Vec<[f32; 2]> = input[at - HOP..at].iter().map(|v| [*v; 2]).collect();
+        let mut s = Stretcher::new();
+        s.engage_primed(at as u64, &history);
+        let out = run(&mut s, &input[at..], 1.0, 8000);
+        // run() feeds from index 0 of the slice; the primed history already
+        // sits before it, so output frame i is input frame at + i.
+        for i in 0..out.len() {
+            assert!((out[i] - input[at + i]).abs() < 1e-4, "frame {i}: {} vs {}", out[i], input[at + i]);
         }
-        let mut cut = LowCut::new(180.0, rate);
-        for i in 0..48000 {
-            let t = i as f32 / rate;
-            let high = (2.0 * std::f32::consts::PI * 4000.0 * t).sin();
-            let y = cut.process([high, high], 1.0)[0];
-            if i > 4800 {
-                treble += y.abs();
+    }
+
+    /// Envelope fluctuation of a stretched sustained chord: the std of 10 ms
+    /// RMS over its mean. Plain overlap-add of unaligned segments makes this
+    /// swing (phasiness); WSOLA's search keeps it small.
+    fn chord_wobble(rate: f64) -> f64 {
+        let fs = 44_100.0;
+        let input: Vec<f32> = (0..(fs as usize * 4))
+            .map(|i| {
+                let t = i as f32 / fs as f32;
+                [220.0f32, 277.2, 329.6, 110.0].iter().map(|f| (2.0 * std::f32::consts::PI * f * t).sin()).sum::<f32>() * 0.2
+            })
+            .collect();
+        let mut s = Stretcher::new();
+        s.engage(0);
+        let out = run(&mut s, &input, rate, fs as usize * 3);
+        let body = &out[WINDOW * 2..out.len() - WINDOW * 2];
+        let rms: Vec<f64> = body.chunks(441).map(|c| (c.iter().map(|v| f64::from(v * v)).sum::<f64>() / c.len() as f64).sqrt()).collect();
+        let mean = rms.iter().sum::<f64>() / rms.len() as f64;
+        (rms.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / rms.len() as f64).sqrt() / mean
+    }
+
+    #[test]
+    fn stretched_chords_stay_steady() {
+        for rate in [0.85, 0.92, 1.08, 1.18] {
+            let wobble = chord_wobble(rate);
+            if std::env::var("BENCH_DEBUG").is_ok() {
+                eprintln!("rate {rate}: wobble {wobble:.4}");
             }
+            assert!(wobble < 0.2, "rate {rate}: envelope wobble {wobble:.3}");
         }
-        assert!(bass / treble < 0.15, "bass {bass} treble {treble}");
     }
 }

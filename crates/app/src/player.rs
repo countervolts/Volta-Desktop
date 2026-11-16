@@ -83,6 +83,19 @@ pub struct Player {
     preloaded: Option<(u64, usize)>,
     /// Song transitions (`TRANSITION_MODE_KEY`, `CROSSFADE_KEY`).
     pub transition: Transition,
+    /// AutoMix also mixes albums played in order (`AUTOMIX_ALBUMS_KEY`).
+    pub mix_albums: bool,
+    /// The Up Next AutoMix toggle: AutoMix for this queue (reset to on when a
+    /// new queue starts, like Apple Music's per-queue button).
+    pub automix_queue: bool,
+    /// Planner thresholds (defaults, or `automix-planner.json` in the data
+    /// folder, which the measurement lab can write).
+    pub planner: volta_logic::mix_planner::PlannerConfig,
+    /// Why the coming (or running) transition is what it is, for the
+    /// status line: `(incoming index, text)`.
+    pub mix_status: Option<(usize, String)>,
+    /// The planned transition being scheduled or mixed (kind and label).
+    pub mix_kind: Option<volta_logic::mix_planner::TransitionKind>,
     /// A blend into this preload token was requested, and when.
     blend: Option<(u64, std::time::Instant)>,
     /// A blend into this token failed; that pair falls back to gapless.
@@ -139,6 +152,11 @@ impl Player {
             current_token: 0,
             preloaded: None,
             transition: Transition::Off,
+            mix_albums: true,
+            automix_queue: true,
+            planner: Default::default(),
+            mix_status: None,
+            mix_kind: None,
             blend: None,
             failed_blend: 0,
             automix_label: None,
@@ -185,11 +203,15 @@ impl Player {
             self.audio.send(Command::CancelBlend);
         }
         self.automix_label = None;
+        self.mix_kind = None;
     }
 
     /// Plans the coming transition and, ~10 s ahead, schedules it in the
-    /// engine, which starts it on the exact outgoing sample.
+    /// engine, which starts it on the exact outgoing sample. AutoMix waits
+    /// for both songs' analysis; if it is not ready in time the handoff is
+    /// natural (gapless) rather than a blind crossfade.
     fn check_handoff(&mut self) {
+        use volta_logic::mix_planner::{MixPlan, PairContext, TransitionKind, plan_transition};
         if self.transition == Transition::Off || !self.playing || self.loading || self.blend.is_some() || self.duration <= 0.0 {
             return;
         }
@@ -198,38 +220,58 @@ impl Player {
             return;
         }
         let (Some(from), Some(to)) = (self.queue.get(index).cloned(), self.queue.get(next).cloned()) else { return };
-        let fallback = |seconds: f64, duration: f64| {
+        let crossfade = |seconds: f64, duration: f64| {
             let seconds = seconds.min(to.duration.filter(|d| *d > 0.0).map_or(seconds, |d| d / 2.0)).min(duration / 2.0);
-            volta_logic::mix_planner::MixPlan {
-                style: volta_logic::mix_planner::MixStyle::Blend,
+            MixPlan {
+                kind: TransitionKind::EnergyCrossfade,
                 out_start: (duration - seconds).max(0.0),
                 in_start: 0.0,
                 seconds,
-                tempo: 1.0,
-                bass_swap: false,
-                linear: false,
-                incoming_gain_db: 0.0,
+                automation: volta_audio::TransitionAutomation::equal_power(),
                 bars: 0,
+                tempo: 1.0,
+                score: 1.0,
                 label: "Crossfade · Smooth blend".into(),
+                reason: format!("Crossfade of {seconds:.0} s"),
+                candidates: Vec::new(),
             }
         };
         let plan = match self.transition {
             Transition::Automix => {
-                if from.id == to.id || !volta_logic::automix::automix_eligible(&[&from, &to]) {
+                if !self.automix_queue {
+                    self.set_status(next, "AutoMix is off for this queue");
                     return;
                 }
                 let (server, username) = self.client.as_ref().map(|c| (c.server.clone(), c.username.clone())).unwrap_or_default();
                 let key = |song: &Song| crate::automix_analysis::analysis_key(&server, &username, song, self.original);
+                let context = PairContext {
+                    album_in_order: volta_logic::automix::is_album_sequence(&[&from, &to]),
+                    from_genre: from.genre.clone(),
+                    to_genre: to.genre.clone(),
+                    same_song: from.id == to.id,
+                };
+                let config = volta_logic::mix_planner::PlannerConfig { mix_albums: self.mix_albums, ..self.planner.clone() };
                 match (self.profiles.get(&key(&from)), self.profiles.get(&key(&to))) {
-                    (Some(a), Some(b)) => volta_logic::mix_planner::plan_mix(a, b),
-                    // Not measured yet: a short timed blend.
-                    _ => fallback(4.0, self.duration),
+                    (Some(a), Some(b)) => plan_transition(a, b, &context, &config),
+                    _ => {
+                        // Wait for the analysis; past the last useful moment
+                        // the songs simply play on gaplessly.
+                        let text = if self.position > self.duration - 2.0 { "Not analyzed in time: playing on without a mix" } else { "Analyzing the next song…" };
+                        self.set_status(next, text);
+                        return;
+                    }
                 }
             }
-            Transition::Crossfade(seconds) => fallback(seconds, self.duration),
+            Transition::Crossfade(seconds) => crossfade(seconds, self.duration),
             Transition::Off => return,
         };
-        if plan.seconds < 0.1 || self.position < plan.out_start - 10.0 {
+        self.set_status(next, &format!("{} — {}", plan.kind.name(), plan.reason));
+        if !plan.mixes() {
+            // Natural handoff: the preloaded deck takes over on its own.
+            self.failed_blend = token;
+            return;
+        }
+        if self.position < plan.out_start - 10.0 {
             return;
         }
         if self.position > plan.out_start + 0.25 {
@@ -245,16 +287,44 @@ impl Player {
         self.audio.send(Command::Blend(volta_audio::BlendRequest {
             token,
             seconds: plan.seconds,
-            curve: if plan.linear { volta_audio::BlendCurve::Linear } else { volta_audio::BlendCurve::EqualPower },
             start_at: Some(plan.out_start),
-            tempo: plan.tempo,
-            release_seconds: 8.0,
-            bass_swap: plan.bass_swap,
-            gain_db: plan.incoming_gain_db,
+            automation: plan.automation,
         }));
         self.blend = Some((token, std::time::Instant::now()));
         self.mix_out = plan.out_start;
+        self.mix_kind = Some(plan.kind);
         self.mix_label = (self.transition == Transition::Automix).then_some(plan.label);
+    }
+
+    fn set_status(&mut self, next: usize, text: &str) {
+        if self.mix_status.as_ref().is_none_or(|(i, t)| *i != next || t != text) {
+            self.mix_status = Some((next, text.to_string()));
+        }
+    }
+
+    /// Progress 0–1 of the audible mix (for the cover morph), `None` when no
+    /// mix is playing.
+    pub fn mix_progress(&self) -> Option<f32> {
+        (self.automix_label.is_some() && self.audio.is_blending()).then(|| self.audio.blend_progress())
+    }
+
+    /// The song mixing in, while a mix is audible.
+    pub fn mixing_into(&self) -> Option<&Song> {
+        self.automix_label.as_ref()?;
+        self.preloaded.and_then(|(_, index)| self.queue.get(index))
+    }
+
+    /// The Up Next AutoMix button.
+    pub fn set_automix_queue(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.automix_queue != on {
+            self.automix_queue = on;
+            if !on {
+                self.cancel_blend();
+            }
+            self.failed_blend = 0;
+            self.mix_status = None;
+            cx.notify();
+        }
     }
 
     pub fn set_client(&mut self, client: Option<Arc<Navidrome>>) {
@@ -382,6 +452,7 @@ impl Player {
         self.ordered = songs.clone();
         self.queue = songs;
         self.shuffle = false;
+        self.automix_queue = true;
         let start = start.min(self.queue.len() - 1);
         self.load_index(start, 0.0, true, cx);
     }
@@ -461,6 +532,17 @@ impl Player {
     pub fn next(&mut self, cx: &mut Context<Self>) {
         let Some(index) = self.index else { return };
         self.finish_listen(EventKind::Skip, "manual-next", cx);
+        // Skipping during an audible mix: the incoming song is already
+        // playing, so finish the mix within a third of a second instead of
+        // restarting it from its beginning (the engine then reports Advanced).
+        // (The engine reports a scheduled blend as blending before it is
+        // audible; only an audible one is finished, otherwise skip as usual.)
+        let audible = self.blend.is_some() && self.audio.is_blending() && self.position >= self.mix_out - 0.05;
+        if audible && self.preloaded.is_some_and(|(_, next)| next == index + 1 || (index + 1 == self.queue.len() && next == 0)) {
+            self.audio.send(Command::FinishBlend { seconds: 0.35 });
+            cx.notify();
+            return;
+        }
         if index + 1 < self.queue.len() {
             self.load_index(index + 1, 0.0, true, cx);
         } else if self.repeat == Repeat::All {
@@ -808,6 +890,8 @@ impl Player {
                             self.loading = false;
                             let blended = self.blend.take().is_some();
                             self.automix_label = None;
+                            self.mix_kind = None;
+                            self.mix_status = None;
                             self.finish_listen(EventKind::Complete, if blended { "crossfade" } else { "automatic-complete" }, cx);
                             let song = self.queue[index].clone();
                             let (session_id, session_index) = self.ensure_session();
