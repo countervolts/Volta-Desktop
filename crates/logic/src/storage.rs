@@ -37,6 +37,8 @@ pub const LOCAL_SOURCE_MODE_KEY: &str = "volta-source-mode";
 pub const SEARCH_HISTORY_KEY: &str = "volta-search-history";
 pub const SHARE_PROVIDER_KEY: &str = "volta-share-provider";
 pub const FRAME_MONITOR_KEY: &str = "volta-frame-monitor";
+/// Native-only: "true" opens the developer console window at launch.
+pub const CONSOLE_AT_STARTUP_KEY: &str = "volta-console-at-startup";
 /// Native-only: "false" turns the daily release check off.
 pub const UPDATE_CHECK_KEY: &str = "volta-update-check";
 pub const UPDATE_SKIPPED_KEY: &str = "volta-update-skipped-version";

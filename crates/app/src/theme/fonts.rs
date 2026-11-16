@@ -31,6 +31,29 @@ pub fn ui_font_family(cx: &App) -> SharedString {
         .unwrap_or_else(|| ".SystemUIFont".into())
 }
 
+/// A monospace family that is actually installed. gpui does not resolve the
+/// CSS generic `monospace`, so each OS gets its own list.
+pub fn mono_font_family(cx: &App) -> SharedString {
+    static FAMILY: std::sync::OnceLock<SharedString> = std::sync::OnceLock::new();
+    FAMILY
+        .get_or_init(|| {
+            let installed = cx.text_system().all_font_names();
+            let candidates: &[&str] = if cfg!(target_os = "macos") {
+                &["Menlo", "SF Mono", "Monaco", "Courier New"]
+            } else if cfg!(target_os = "windows") {
+                &["Cascadia Mono", "Consolas", "Courier New"]
+            } else {
+                &["DejaVu Sans Mono", "Liberation Mono", "Noto Sans Mono", "Ubuntu Mono", "Courier New"]
+            };
+            candidates
+                .iter()
+                .find(|name| installed.iter().any(|family| family == *name))
+                .map(|name| SharedString::from(*name))
+                .unwrap_or_else(|| ".SystemUIFont".into())
+        })
+        .clone()
+}
+
 /// CSS `font-variant-numeric: tabular-nums`.
 pub fn tabular_nums() -> FontFeatures {
     FontFeatures(Arc::new(vec![("tnum".into(), 1)]))

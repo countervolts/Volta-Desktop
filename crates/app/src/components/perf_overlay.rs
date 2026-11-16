@@ -6,9 +6,11 @@
 //! replaced by their native counterparts: resident memory, decoded artwork,
 //! data on disk, audio underruns, threads.
 
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui::{Context, FontWeight, IntoElement, ParentElement, Render, Styled, Window, div, prelude::*};
+use parking_lot::Mutex;
 
 use crate::app_state::AppState;
 use crate::theme::{self, mix, sz, transparent};
@@ -19,14 +21,82 @@ const SLOW_FACTOR: f32 = 1.5;
 const SUSPEND_MS: f32 = 1000.0;
 const FALLBACK_INTERVAL_MS: f32 = 1000.0 / 60.0;
 
-pub struct PerfOverlay {
-    state: gpui::Entity<AppState>,
+/// Frame gaps of the main window, shared between whoever measures them (the
+/// in-window overlay samples itself; the performance window is fed by
+/// [`measure_frames`] on the main window) and whoever shows them.
+#[derive(Default)]
+struct Feed {
     samples: Vec<f32>,
     last: Option<Instant>,
+    viewport: String,
+    running: bool,
+}
+
+#[derive(Clone, Default)]
+pub struct SharedFeed(Arc<Mutex<Feed>>);
+
+impl SharedFeed {
+    /// Records the gap since the previous frame of `window`.
+    fn tick(&self, window: &Window) {
+        let now = Instant::now();
+        let mut feed = self.0.lock();
+        if let Some(last) = feed.last {
+            let delta = now.duration_since(last).as_secs_f32() * 1000.0;
+            if delta > 0.0 && delta < SUSPEND_MS {
+                if feed.samples.len() == WINDOW_SIZE {
+                    feed.samples.remove(0);
+                }
+                feed.samples.push(delta);
+            }
+        }
+        feed.last = Some(now);
+        let size = crate::theme::content_size(window);
+        feed.viewport = format!("{}×{} · {}x", f32::from(size.width).round(), f32::from(size.height).round(), window.scale_factor());
+    }
+}
+
+/// Where the metrics are shown.
+#[derive(Clone, Copy, PartialEq)]
+enum Placement {
+    /// Floating panel over the main window; samples that window itself.
+    Overlay,
+    /// Its own native window; samples come from [`measure_frames`].
+    Window,
+}
+
+pub struct PerfOverlay {
+    state: gpui::Entity<AppState>,
+    placement: Placement,
+    feed: SharedFeed,
+    samples: Vec<f32>,
     started: Instant,
     reported: Instant,
     interval: f32,
     report: Report,
+}
+
+/// Measures `window`'s frame delivery into `feed` after every frame, for as
+/// long as the performance window is open. Asking for the next frame keeps the
+/// window presenting without redrawing anything itself.
+pub fn measure_frames(feed: SharedFeed, window: &mut Window, cx: &mut gpui::App) {
+    if !crate::tools::performance_window_open(cx) {
+        feed.0.lock().running = false;
+        return;
+    }
+    feed.tick(window);
+    window.on_next_frame(move |window, cx| measure_frames(feed, window, cx));
+}
+
+impl SharedFeed {
+    /// Starts [`measure_frames`] unless it is already running.
+    pub fn start(&self, window: &mut Window, cx: &mut gpui::App) {
+        let mut feed = self.0.lock();
+        if !std::mem::replace(&mut feed.running, true) {
+            feed.last = None;
+            drop(feed);
+            measure_frames(self.clone(), window, cx);
+        }
+    }
 }
 
 #[derive(Default, Clone)]
@@ -83,11 +153,73 @@ fn estimate_interval(samples: &[f32]) -> Option<(f32, f32)> {
     Some((interval, 1.0 - late as f32 / samples.len() as f32))
 }
 
-/// Resident set size (Linux `/proc/self/statm`).
+/// Resident memory of this process, on every desktop OS.
+#[cfg(target_os = "linux")]
 fn resident_memory() -> Option<u64> {
     let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
     let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
-    Some(pages * 4096)
+    // SAFETY: `sysconf` has no preconditions.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    Some(pages * if page > 0 { page as u64 } else { 4096 })
+}
+
+#[cfg(target_os = "windows")]
+fn resident_memory() -> Option<u64> {
+    #[repr(C)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn K32GetProcessMemoryInfo(process: isize, counters: *mut ProcessMemoryCounters, size: u32) -> i32;
+    }
+    // SAFETY: the struct matches PROCESS_MEMORY_COUNTERS and `cb` is its size.
+    unsafe {
+        let mut counters: ProcessMemoryCounters = std::mem::zeroed();
+        counters.cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
+        (K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) != 0).then_some(counters.working_set_size as u64)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn resident_memory() -> Option<u64> {
+    /// `mach_task_basic_info`.
+    #[repr(C)]
+    struct TaskBasicInfo {
+        virtual_size: u64,
+        resident_size: u64,
+        resident_size_max: u64,
+        user_time: [i32; 2],
+        system_time: [i32; 2],
+        policy: i32,
+        suspend_count: i32,
+    }
+    const MACH_TASK_BASIC_INFO: u32 = 20;
+    unsafe extern "C" {
+        fn mach_task_self() -> u32;
+        fn task_info(task: u32, flavor: u32, info: *mut TaskBasicInfo, count: *mut u32) -> i32;
+    }
+    // SAFETY: `info` is a `mach_task_basic_info` and `count` is its size in 32-bit words.
+    unsafe {
+        let mut info: TaskBasicInfo = std::mem::zeroed();
+        let mut count = (std::mem::size_of::<TaskBasicInfo>() / 4) as u32;
+        (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, &mut info, &mut count) == 0).then_some(info.resident_size)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+fn resident_memory() -> Option<u64> {
+    None
 }
 
 fn dir_size(path: &std::path::Path) -> u64 {
@@ -106,12 +238,13 @@ fn dir_size(path: &std::path::Path) -> u64 {
 }
 
 impl PerfOverlay {
-    pub fn new(state: gpui::Entity<AppState>) -> Self {
+    fn with(state: gpui::Entity<AppState>, placement: Placement, feed: SharedFeed) -> Self {
         let now = Instant::now();
         Self {
             state,
+            placement,
+            feed,
             samples: Vec::with_capacity(WINDOW_SIZE),
-            last: None,
             started: now,
             reported: now,
             interval: FALLBACK_INTERVAL_MS,
@@ -119,25 +252,43 @@ impl PerfOverlay {
         }
     }
 
-    fn sample(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let now = Instant::now();
-        if let Some(last) = self.last {
-            let delta = now.duration_since(last).as_secs_f32() * 1000.0;
-            if delta > 0.0 && delta < SUSPEND_MS {
-                if self.samples.len() == WINDOW_SIZE {
-                    self.samples.remove(0);
+    /// The floating panel inside the main window.
+    pub fn new(state: gpui::Entity<AppState>) -> Self {
+        Self::with(state, Placement::Overlay, SharedFeed::default())
+    }
+
+    /// The contents of the performance window, fed by [`measure_frames`].
+    pub fn windowed(state: gpui::Entity<AppState>, feed: SharedFeed, cx: &mut Context<Self>) -> Self {
+        // Nothing animates here, so refresh on a timer instead of every frame.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(REFRESH_MS as u64)).await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
                 }
-                self.samples.push(delta);
             }
+        })
+        .detach();
+        Self::with(state, Placement::Window, feed)
+    }
+
+    fn sample(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.placement == Placement::Overlay {
+            self.feed.tick(window);
         }
-        self.last = Some(now);
+        let now = Instant::now();
         if now.duration_since(self.reported).as_millis() >= REFRESH_MS {
             self.reported = now;
-            self.build_report(window, cx);
+            self.build_report(cx);
         }
     }
 
-    fn build_report(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn build_report(&mut self, cx: &mut Context<Self>) {
+        {
+            let feed = self.feed.0.lock();
+            self.samples.clone_from(&feed.samples);
+            self.report.viewport.clone_from(&feed.viewport);
+        }
         let estimate = estimate_interval(&self.samples);
         if let Some((interval, _)) = estimate {
             self.interval = interval;
@@ -176,8 +327,6 @@ impl PerfOverlay {
         }
         .into();
         r.device = format!("{} threads", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
-        let size = crate::theme::content_size(window);
-        r.viewport = format!("{}×{} · {}x", f32::from(size.width).round(), f32::from(size.height).round(), window.scale_factor());
     }
 }
 
@@ -185,8 +334,12 @@ impl Render for PerfOverlay {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sample(window, cx);
         // `requestAnimationFrame` loop: keep sampling frames while shown.
-        window.request_animation_frame();
+        if self.placement == Placement::Overlay {
+            window.request_animation_frame();
+        }
+        let overlay = self.placement == Placement::Overlay;
         let tokens = theme::tokens(cx).clone();
+        let mono = theme::fonts::mono_font_family(cx);
         let r = self.report.clone();
         let metric = |label: &str, value: String| {
             div()
@@ -202,7 +355,7 @@ impl Render for PerfOverlay {
                         .whitespace_nowrap()
                         .text_ellipsis()
                         .text_size(sz(9.0))
-                        .font_family(gpui::SharedString::from("monospace"))
+                        .font_family(mono.clone())
                         .text_color(tokens.text)
                         .child(value),
                 )
@@ -244,25 +397,31 @@ impl Render for PerfOverlay {
             }))
             .child(div().absolute().left_0().right_0().bottom(gpui::relative(r.baseline)).h(sz(1.0)).bg(theme::hex("#ffffff40")));
         div()
-            .absolute()
-            .top(sz(54.0))
-            .right(sz(12.0))
-            .bottom(sz(54.0))
-            .w(sz(348.0))
             .flex()
             .flex_col()
             .overflow_hidden()
-            .border(sz(1.0))
-            .border_color(mix(tokens.text, 20.0, transparent()))
-            .rounded(sz(20.0))
-            .bg(mix(tokens.sidebar, 97.0, tokens.canvas))
-            .shadow(vec![gpui::BoxShadow {
-                color: theme::hex("#0000002b"),
-                offset: gpui::point(gpui::px(0.0), gpui::px(12.0)),
-                blur_radius: gpui::px(34.0),
-                spread_radius: gpui::px(0.0),
-                inset: false,
-            }])
+            .map(|d| {
+                if overlay {
+                    d.absolute()
+                        .top(sz(54.0))
+                        .right(sz(12.0))
+                        .bottom(sz(54.0))
+                        .w(sz(348.0))
+                        .border(sz(1.0))
+                        .border_color(mix(tokens.text, 20.0, transparent()))
+                        .rounded(sz(20.0))
+                        .bg(mix(tokens.sidebar, 97.0, tokens.canvas))
+                        .shadow(vec![gpui::BoxShadow {
+                            color: theme::hex("#0000002b"),
+                            offset: gpui::point(gpui::px(0.0), gpui::px(12.0)),
+                            blur_radius: gpui::px(34.0),
+                            spread_radius: gpui::px(0.0),
+                            inset: false,
+                        }])
+                } else {
+                    d.size_full().bg(tokens.canvas)
+                }
+            })
             .text_color(tokens.text)
             .text_size(sz(11.0))
             .line_height(gpui::relative(1.4))
@@ -288,7 +447,7 @@ impl Render for PerfOverlay {
                                     .child(div().text_size(sz(10.0)).text_color(tokens.muted).child("Diagnostics")),
                             ),
                     )
-                    .child(div().max_w(sz(110.0)).text_size(sz(10.0)).text_color(tokens.muted).child("live · 500 ms sample")),
+                    .child(div().max_w(sz(110.0)).text_size(sz(10.0)).text_color(tokens.muted).child(if overlay { "live · 500 ms sample" } else { "main window · 500 ms" })),
             )
             .child(
                 div()

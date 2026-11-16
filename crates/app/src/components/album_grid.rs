@@ -10,7 +10,7 @@
 //! - `max-width: 640px`: grid 2 columns, gap 25/15; shelf `(100% − 26px) / 2.3`;
 //!   featured 70 %; caption 13px; play button always visible (32px).
 
-use gpui::{AnyElement, App, Entity, FontWeight, IntoElement, ParentElement, SharedString, Styled, div, img, prelude::*};
+use gpui::{AnyElement, App, Entity, FontWeight, IntoElement, ParentElement, SharedString, Styled, Window, div, img, point, prelude::*, px};
 use volta_logic::format::album_name;
 use volta_logic::model::AlbumRecord;
 
@@ -238,6 +238,56 @@ fn shelf_scroll(id: &str) -> gpui::ScrollHandle {
     })
 }
 
+thread_local! {
+    /// Latest page-scroll per shelf: (generation, target offset in px). A shelf that is
+    /// still gliding when the next button press arrives continues from its target.
+    static SHELF_GLIDE: std::cell::RefCell<std::collections::HashMap<String, (u64, f32)>> = Default::default();
+}
+
+const GLIDE_MS: f32 = 280.0;
+
+/// Moves a shelf one page: `forward` shows the next covers. A page is as many whole covers as fit.
+fn page_shelf(id: &str, handle: &gpui::ScrollHandle, forward: bool, pitch: f32, content_width: f32, gap: f32, window: &mut Window, cx: &mut App) {
+    let rem = window.rem_size();
+    let to_px = |css: f32| f32::from(sz(css).to_pixels(rem));
+    let max = f32::from(handle.max_offset().x);
+    let current = -f32::from(handle.offset().x);
+    let (generation, base) = SHELF_GLIDE.with(|g| {
+        let g = g.borrow();
+        g.get(id).map_or((1, current), |(n, target)| (n + 1, *target))
+    });
+    let covers = ((content_width + gap) / pitch).floor().max(1.0);
+    let step = covers * to_px(pitch);
+    let target = (base + if forward { step } else { -step }).clamp(0.0, max);
+    if (target - current).abs() < 0.5 {
+        return;
+    }
+    SHELF_GLIDE.with(|g| g.borrow_mut().insert(id.to_string(), (generation, target)));
+    if cx.reduce_motion() {
+        handle.set_offset(point(px(-target), px(0.0)));
+        SHELF_GLIDE.with(|g| g.borrow_mut().remove(id));
+        window.refresh();
+        return;
+    }
+    glide_shelf(id.to_string(), handle.clone(), generation, current, target, std::time::Instant::now(), window);
+}
+
+fn glide_shelf(id: String, handle: gpui::ScrollHandle, generation: u64, from: f32, to: f32, started: std::time::Instant, window: &mut Window) {
+    // A newer press took over.
+    if SHELF_GLIDE.with(|g| g.borrow().get(&id).is_none_or(|(n, _)| *n != generation)) {
+        return;
+    }
+    let t = (started.elapsed().as_secs_f32() * 1000.0 / GLIDE_MS).min(1.0);
+    let eased = 1.0 - (1.0 - t).powi(3);
+    handle.set_offset(point(px(-(from + (to - from) * eased)), px(0.0)));
+    window.refresh();
+    if t < 1.0 {
+        window.on_next_frame(move |window, _| glide_shelf(id, handle, generation, from, to, started, window));
+    } else {
+        SHELF_GLIDE.with(|g| g.borrow_mut().remove(&id));
+    }
+}
+
 /// Renders `albums` as `kind`. `id` must be unique on the page (it keys the
 /// shelf scroll position and the card hover groups).
 pub fn album_grid(
@@ -282,54 +332,70 @@ pub fn album_grid(
         }
         _ => {
             let cards: Vec<AnyElement> = (0..albums.len()).map(|i| card(i, cx)).collect();
-            // The shelf reaches into the page's side padding (and pads itself
-            // back), and fades out over that margin wherever more covers lie
-            // that way, so a scrolled cover dissolves at the edge instead of
-            // being sliced. At rest it lines up with the text as before.
+            // The shelf is clipped to the page content, so covers never run beneath the
+            // sidebar or into the side margins. The wheel is not handled here, so it
+            // scrolls the page; a bare chevron in each margin pages through the shelf,
+            // shown only while the pointer is over the shelf.
             let (_, pad_x, _) = crate::theme::main_padding(viewport_width);
-            // The floating sidebar sits over the page: the shelf runs on beneath it, to the
-            // window's edge, so only the right side needs a fade.
-            let inset = crate::theme::sidebar_inset(cx);
             let handle = shelf_scroll(id);
             let offset = -f32::from(handle.offset().x);
             let max = f32::from(handle.max_offset().x);
-            let canvas = crate::theme::tokens(cx).canvas;
-            let fade = |left: bool| {
-                // `0°` points up, clockwise: the page colour sits at the outer edge.
-                let angle = if left { 90.0 } else { 270.0 };
+            // Scroll range is only known after the first layout: render once more.
+            if max <= 0.0 && f32::from(handle.bounds().size.width) <= 0.0 {
+                let state = state.clone();
+                cx.defer(move |cx| state.update(cx, |_, cx| cx.notify()));
+            }
+            let tokens = crate::theme::tokens(cx).clone();
+            let pitch = m.card_width.unwrap_or(tile) + m.column_gap;
+            let (content, gap) = (content_width, m.column_gap);
+            let hover_group = SharedString::from(format!("shelf-hover-{id}"));
+            // Centred in the side margin (at least 30px wide) and on the artwork.
+            let button_width = pad_x.max(30.0);
+            let nav = |forward: bool| {
+                let (handle, shelf_id, group) = (handle.clone(), id.to_string(), hover_group.clone());
                 div()
+                    .id(SharedString::from(format!("shelf-{id}-{}", if forward { "next" } else { "prev" })))
                     .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .w(sz(pad_x + 18.0))
-                    .map(|d| if left { d.left(sz(-pad_x)) } else { d.right(sz(-pad_x)) })
-                    .bg(gpui::linear_gradient(
-                        angle,
-                        gpui::linear_color_stop(canvas, 0.0),
-                        gpui::linear_color_stop(canvas.opacity(0.0), 1.0),
-                    ))
+                    .top(sz(tile / 2.0 - 22.0))
+                    .map(|d| {
+                        let inset = sz((pad_x - button_width) / 2.0);
+                        if forward { d.right(inset) } else { d.left(inset) }
+                    })
+                    .w(sz(button_width))
+                    .h(sz(44.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(tokens.text)
+                    .opacity(0.0)
+                    .group_hover(group, |s| s.opacity(0.85))
+                    .hover(|s| s.opacity(1.0))
+                    .cursor_pointer()
+                    .on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        page_shelf(&shelf_id, &handle, forward, pitch, content, gap, window, cx);
+                    })
+                    .child(icon_with(if forward { "chevron-right" } else { "chevron-left" }, 24.0, Some(2.0), false))
             };
+            // Reaches into the side margins so they count as part of the hover area.
             div()
                 .relative()
+                .group(hover_group.clone())
+                .ml(sz(-pad_x))
+                .mr(sz(-pad_x))
+                .px(sz(pad_x))
                 .child(
                     div()
                         .id(SharedString::from(format!("shelf-{id}")))
                         .track_scroll(&handle)
                         .flex()
                         .gap(sz(m.column_gap))
-                        .overflow_x_scroll()
-                        // The wheel turns the shelf sideways and stays with it at either end,
-                        // so reaching the last cover never throws the page down.
-                        .contain_scroll()
-                        .ml(sz(-(pad_x + inset)))
-                        .mr(sz(-pad_x))
-                        .pl(sz(pad_x + inset))
-                        .pr(sz(pad_x))
+                        .overflow_x_hidden()
                         .pb(sz(10.0))
                         .children(cards),
                 )
-                .when(offset > 0.5 && inset <= 0.0, |d| d.child(fade(true)))
-                .when(max - offset > 0.5, |d| d.child(fade(false)))
+                .when(offset > 0.5, |d| d.child(nav(false)))
+                .when(max - offset > 0.5, |d| d.child(nav(true)))
                 .into_any_element()
         }
     }

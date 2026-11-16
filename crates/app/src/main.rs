@@ -4,6 +4,7 @@ mod app_icon;
 mod app_state;
 mod assets;
 mod components;
+mod console;
 mod covers;
 mod automix_analysis;
 mod infinite;
@@ -16,6 +17,7 @@ mod recommend;
 #[cfg(feature = "shots")]
 mod shot;
 mod theme;
+mod tools;
 mod views;
 
 use gpui::{App, AppContext, Bounds, Entity, TitlebarOptions, Window, WindowAppearance, WindowBounds, WindowOptions, px, size};
@@ -60,8 +62,7 @@ pub(crate) fn build_root(storage: &Storage, window: &mut Window, cx: &mut App) -
 }
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,volta=info,volta_audio=info"))
-        .init();
+    console::init_logger();
     let storage = Storage::open_default();
     if let Some(path) = storage.path() {
         log::info!("storage: {}", path.display());
@@ -79,6 +80,12 @@ fn main() {
     app_icon::register_desktop_entry();
     application().with_assets(assets::Assets).run(move |cx: &mut App| {
         init_globals(&storage, cx);
+
+        // Developer option: show the log console at launch. Opened first so
+        // the main window ends up in front.
+        if storage.get(volta_logic::storage::CONSOLE_AT_STARTUP_KEY) == "true" {
+            tools::open_console(cx);
+        }
 
         // Default 1440×900, like the canonical screenshot size; the web's
         // `min-width: 320px` is the minimum.
@@ -136,7 +143,15 @@ fn main() {
                 },
             )
             .expect("open window");
-        let _ = window;
+        // Tool windows (performance, console) belong to the main window.
+        let main_id = window.window_id();
+        tools::register_main(window.into(), cx);
+        cx.on_window_closed(move |cx, id| {
+            if id == main_id {
+                tools::close_all(cx);
+            }
+        })
+        .detach();
         cx.activate(true);
     });
 }

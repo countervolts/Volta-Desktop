@@ -12,7 +12,7 @@ use crate::components::ui::{icon, icon_with};
 use crate::theme::{self, Tokens, mix, sz, transparent};
 use crate::views::library::secondary_button;
 
-pub const TABS: [(&str, &str, &str); 8] = [
+pub const TABS: [(&str, &str, &str); 9] = [
     ("appearance", "Appearance", "palette"),
     ("playback", "Playback", "audio-lines"),
     ("privacy", "Privacy", "shield-check"),
@@ -20,6 +20,7 @@ pub const TABS: [(&str, &str, &str); 8] = [
     ("keyboard", "Keyboard", "keyboard"),
     ("help", "Help", "life-buoy"),
     ("account", "Account", "circle-user-round"),
+    ("developer", "Developer", "flask-conical"),
     ("diagnostics", "Diagnostics", "gauge"),
 ];
 
@@ -686,6 +687,39 @@ fn privacy(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyElemen
     )
 }
 
+/// Developer options, offered in every build on every OS.
+fn developer(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyElement {
+    let console_at_startup = pref(state, keys::CONSOLE_AT_STARTUP_KEY, cx) == "true";
+    let (open_state, toggle_state) = (state.clone(), state.clone());
+    section(
+        tokens,
+        "Developer",
+        vec![
+            row(
+                tokens,
+                "orange",
+                "gauge",
+                "Performance window",
+                "Open a separate window with live frame rate, memory, and runtime metrics for Volta.",
+                secondary_button("open-performance-window", "Click here", "", cx)
+                    .on_click(move |_, _, cx| crate::tools::open_performance(&open_state, cx))
+                    .into_any_element(),
+            ),
+            row(
+                tokens,
+                "gray",
+                "file-text",
+                "Open console at startup",
+                "Show Volta's log output in a console window every time the app launches. Takes effect on the next launch.",
+                checkbox("console-at-startup", console_at_startup, tokens, move |v, cx| {
+                    set_pref(&toggle_state, keys::CONSOLE_AT_STARTUP_KEY, if v { "true" } else { "false" }, cx)
+                }),
+            ),
+        ],
+        "Tools for debugging and profiling Volta. They work the same on Linux, macOS, and Windows.",
+    )
+}
+
 fn diagnostics(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyElement {
     let overlay = pref(state, keys::FRAME_MONITOR_KEY, cx) == "true";
     let (s1, s2, s3) = (state.clone(), state.clone(), state.clone());
@@ -1005,6 +1039,7 @@ pub fn render(state: &Entity<AppState>, _content_width: f32, window: &mut Window
             "Find setup guidance, troubleshooting, and Volta’s privacy notes.",
         ),
         "account" => account(state, &tokens, cx),
+        "developer" => developer(state, &tokens, cx),
         "diagnostics" if diagnostics_enabled() => diagnostics(state, &tokens, cx),
         _ => appearance(state, &tokens, cx),
     };

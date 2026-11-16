@@ -476,7 +476,6 @@ impl Render for Shell {
         } else {
             crate::components::sidebar::animated_width(viewport, motion.rail) + if floating { 16.0 } else { 0.0 }
         };
-        cx.set_global(theme::SidebarInset(sidebar_outer));
         let (pad_top, pad_x, pad_bottom) = theme::main_padding(viewport);
         // `.artist-page-content { padding-top: 0 }`.
         let pad_top = if route.page == Page::Artist { 0.0 } else { pad_top };

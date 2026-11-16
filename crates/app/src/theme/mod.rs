@@ -62,17 +62,6 @@ pub fn main_padding(viewport: f32) -> (f32, f32, f32) {
 pub struct Viewport(pub f32);
 impl Global for Viewport {}
 
-/// The width of the sidebar plus its margins, in CSS px (0 when it is a drawer), published
-/// by the shell each frame. The sidebar floats over the page, so horizontal shelves reach
-/// under it by this much instead of ending at its edge.
-#[derive(Clone, Copy)]
-pub struct SidebarInset(pub f32);
-impl Global for SidebarInset {}
-
-pub fn sidebar_inset(cx: &App) -> f32 {
-    cx.try_global::<SidebarInset>().map(|v| v.0).unwrap_or(0.0)
-}
-
 pub fn viewport(cx: &App) -> f32 {
     cx.try_global::<Viewport>().map(|v| v.0).unwrap_or(1440.0)
 }
