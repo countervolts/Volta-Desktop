@@ -1,0 +1,57 @@
+name: Bug report
+description: Something in Volta isn't working
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please search the existing issues first. For security problems, don't use this form (see the security policy).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open …
+        2. Click …
+        3. See …
+  - type: textarea
+    id: version
+    attributes:
+      label: Version info
+      description: In Volta, open Settings → About and choose **Copy version info**, then paste it here. It covers the version, build, operating system, and hardware.
+      render: text
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: Music source
+      options:
+        - Navidrome
+        - Another Subsonic server
+        - Local files (this device)
+        - Not related to a source
+  - type: input
+    id: library-size
+    attributes:
+      label: Library size
+      description: Roughly how many songs, if it might matter (slowness, memory, loading).
+      placeholder: e.g. 40,000 songs
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Volta keeps logs of its last three sessions. In Settings → Help, choose **Open logs folder**, then drag the `latest` folder (zipped) into this box, or paste the relevant lines from `volta.log` and `performance.log`.
+        The logs include your server address, so remove it first if you'd rather not share it.
+  - type: textarea
+    id: extra
+    attributes:
+      label: Screenshots or anything else
