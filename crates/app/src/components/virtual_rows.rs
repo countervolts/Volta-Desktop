@@ -52,11 +52,29 @@ pub fn virtual_rows(
     cx: &mut App,
     render: impl FnOnce(Range<usize>, &mut App) -> Vec<AnyElement>,
 ) -> AnyElement {
-    let id = id.into();
     let handle = cx.try_global::<MainScroll>().map(|s| s.0.clone());
-    let Some(handle) = handle.filter(|_| total > MIN_ROWS) else {
+    match handle {
+        Some(handle) => virtual_rows_with(id, &handle, total, estimate, gap, cx, render),
+        None => rows_block(render(0..total, cx), 0, total, gap).into_any_element(),
+    }
+}
+
+/// The same list, driven by a scroll container passed in instead of the page's.
+/// The sidebar scrolls on its own, so its rows cannot use [`MainScroll`].
+pub fn virtual_rows_with(
+    id: impl Into<SharedString>,
+    handle: &ScrollHandle,
+    total: usize,
+    estimate: f32,
+    gap: f32,
+    cx: &mut App,
+    render: impl FnOnce(Range<usize>, &mut App) -> Vec<AnyElement>,
+) -> AnyElement {
+    let id = id.into();
+    let handle = handle.clone();
+    if total <= MIN_ROWS {
         return rows_block(render(0..total, cx), 0, total, gap).into_any_element();
-    };
+    }
 
     let known = MEASURES.with(|m| m.borrow().get(&id).copied());
     let measure = known.unwrap_or(Measure { top: 0.0, pitch: estimate.max(1.0), scale: 1.0 });
@@ -102,6 +120,8 @@ pub fn virtual_rows(
     div()
         .flex()
         .flex_col()
+        .w_full()
+        .min_w_0()
         .child(div().h(px(above)).flex_none())
         .child(rows.relative().child(probe))
         .child(div().h(px(below.max(0.0))).flex_none())

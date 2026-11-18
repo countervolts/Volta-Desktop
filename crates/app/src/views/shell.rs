@@ -33,6 +33,8 @@ pub struct Shell {
     focus: gpui::FocusHandle,
     folder_search: Entity<InputState>,
     main_scroll: gpui::ScrollHandle,
+    /// The sidebar's own list has to scroll independently of the page.
+    sidebar_scroll: gpui::ScrollHandle,
     /// `PerformanceOverlay`, created while the frame monitor is on.
     perf: Option<Entity<crate::components::perf_overlay::PerfOverlay>>,
     /// The message of a panic caught while building the page.
@@ -95,6 +97,7 @@ impl Shell {
                 cx.set_global(crate::components::virtual_rows::MainScroll(handle.clone()));
                 handle
             },
+            sidebar_scroll: gpui::ScrollHandle::new(),
             crash: None,
             perf: None,
         }
@@ -581,7 +584,7 @@ impl Render for Shell {
             .when(!narrow, |d| d.child(div().flex_none().w(sz(sidebar_outer))))
             .child(workspace)
             .when(!narrow, |d| {
-                d.child(div().absolute().top_0().bottom_0().left_0().flex().child(sidebar::render(&self.state, window, cx)))
+                d.child(div().absolute().top_0().bottom_0().left_0().flex().child(sidebar::render(&self.state, &self.sidebar_scroll, window, cx)))
             })
             .when_some(panel.filter(|_| inspector_column), |d, panel| d.child(inspector::render(&self.state, &self.lyrics, panel, viewport, cx)))
             .children({
@@ -639,7 +642,7 @@ impl Render for Shell {
                         .bottom_0()
                         .left_0()
                         .flex()
-                        .child(sidebar::render(&self.state, window, cx)),
+                        .child(sidebar::render(&self.state, &self.sidebar_scroll, window, cx)),
                 )
             })
             .into_any_element();

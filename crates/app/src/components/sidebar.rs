@@ -14,6 +14,11 @@ use crate::theme::{self, Tokens, mix, sz, transparent};
 
 pub const RAIL_WIDTH: f32 = 68.0;
 
+/// The sidebar is rebuilt on every frame, so its long lists are windowed: only
+/// rows near the visible part of the sidebar are built. The scroll container is
+/// tracked separately from the page's scroller.
+const ROW_PITCH: f32 = 40.0;
+
 struct NavItem {
     page: Page,
     icon: &'static str,
@@ -114,7 +119,12 @@ fn nav_icon(name: &str, tokens: &Tokens) -> AnyElement {
     div().text_color(tokens.accent).child(icon_with(name, 17.0, Some(1.8), false)).into_any_element()
 }
 
-pub fn render(state: &Entity<AppState>, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+pub fn render(
+    state: &Entity<AppState>,
+    scroll_handle: &gpui::ScrollHandle,
+    _window: &mut Window,
+    cx: &mut App,
+) -> impl IntoElement {
     let tokens = theme::tokens(cx).clone();
     // The rail layout switches in once the labels have faded (collapsing) or
     // the full layout at once (expanding); width and padding glide between.
@@ -124,8 +134,10 @@ pub fn render(state: &Entity<AppState>, _window: &mut Window, cx: &mut App) -> i
     LABELS.with(|l| l.set(motion.labels));
     let floating = state.read(cx).floating_sidebar;
     let route = state.read(cx).route().clone();
-    let playlists = state.read(cx).playlists.clone();
-    let username = state.read(cx).account_label();
+    let (playlists, username) = {
+        let s = state.read(cx);
+        (s.playlists.clone(), s.account_label())
+    };
 
     let navigate = |page: Page| {
         let state = state.clone();
@@ -221,40 +233,54 @@ pub fn render(state: &Entity<AppState>, _window: &mut Window, cx: &mut App) -> i
             .collect()
     };
 
-    let playlist_rows: Vec<AnyElement> = playlists
-        .iter()
-        .enumerate()
-        .map(|(index, playlist)| {
-            let selected = route.page == Page::Playlist && route.id.as_deref() == Some(playlist.id.as_str());
-            let cover = state.update(cx, |state, cx| state.cover(playlist.cover_art.as_deref(), 60, cx));
-            let artwork = div()
-                .size(sz(21.0))
-                .flex_none()
-                .rounded(sz(3.0))
-                .overflow_hidden()
-                .bg(tokens.surface)
-                .when_some(cover, |a, image| a.child(img(image).size_full().rounded(sz(3.0))))
-                .into_any_element();
-            let target = Route {
-                page: Page::Playlist,
-                id: Some(playlist.id.clone()),
-                title: Some(playlist.name.clone()),
-            };
-            let state = state.clone();
-            row(("playlist", index), artwork, playlist.name.clone().into(), selected, collapsed, &tokens)
-                .on_click(move |_, _, cx| {
-                    let target = target.clone();
-                    state.update(cx, |state, cx| state.navigate(target, cx));
-                })
-                .into_any_element()
-        })
-        .collect();
+    let playlist_rows = {
+        let (state, tokens, route) = (state.clone(), tokens.clone(), route.clone());
+        let total = playlists.len();
+        crate::components::virtual_rows::virtual_rows_with(
+            "sidebar-playlists",
+            scroll_handle,
+            total,
+            ROW_PITCH,
+            3.0,
+            cx,
+            move |range, cx| {
+                range
+                    .map(|index| {
+                        let playlist = &playlists[index];
+                        let selected = route.page == Page::Playlist && route.id.as_deref() == Some(playlist.id.as_str());
+                        let cover = state.update(cx, |state, cx| state.cover(playlist.cover_art.as_deref(), 60, cx));
+                        let artwork = div()
+                            .size(sz(21.0))
+                            .flex_none()
+                            .rounded(sz(3.0))
+                            .overflow_hidden()
+                            .bg(tokens.surface)
+                            .when_some(cover, |a, image| a.child(img(image).size_full().rounded(sz(3.0))))
+                            .into_any_element();
+                        let target = Route {
+                            page: Page::Playlist,
+                            id: Some(playlist.id.clone()),
+                            title: Some(playlist.name.clone()),
+                        };
+                        let state = state.clone();
+                        row(("playlist", index), artwork, playlist.name.clone().into(), selected, collapsed, &tokens)
+                            .on_click(move |_, _, cx| {
+                                let target = target.clone();
+                                state.update(cx, |state, cx| state.navigate(target, cx));
+                            })
+                            .into_any_element()
+                    })
+                    .collect()
+            },
+        )
+    };
 
     let nav = div()
         .id("sidebar-nav")
         .flex_1()
         .min_h_0()
         .overflow_y_scroll()
+        .track_scroll(scroll_handle)
         .flex()
         .flex_col()
         // A little air between rows so two highlighted rows never fuse into one block.
@@ -274,8 +300,8 @@ pub fn render(state: &Entity<AppState>, _window: &mut Window, cx: &mut App) -> i
             )
             .on_click(navigate(Page::Playlists)),
         )
-        .children(playlist_rows)
-        .children(pinned_section(state, &route, collapsed, &tokens, cx));
+        .child(playlist_rows)
+        .children(pinned_section(state, &route, collapsed, &tokens, scroll_handle, cx));
 
     let link = |id: &'static str, text: &'static str, url: &'static str, github: bool| {
         div()
@@ -390,13 +416,15 @@ pub fn render(state: &Entity<AppState>, _window: &mut Window, cx: &mut App) -> i
         .child(account)
 }
 
-
 /// `renderPinRows` and the Pinned / Pinned Albums / Artists / Playlists headings.
+/// Like playlists, pins are windowed: a large pinned collection must not be
+/// rebuilt on every frame of an unrelated scroll or animation.
 fn pinned_section(
     state: &Entity<AppState>,
     route: &crate::app_state::Route,
     collapsed: bool,
     tokens: &Tokens,
+    scroll_handle: &gpui::ScrollHandle,
     cx: &mut App,
 ) -> Vec<AnyElement> {
     use volta_logic::storage::{Pin, PinKind, pin_key};
@@ -407,94 +435,108 @@ fn pinned_section(
     if pins.is_empty() {
         return Vec::new();
     }
-    let rows_for = |items: Vec<Pin>, cx: &mut App| -> Vec<AnyElement> {
-        items
-            .into_iter()
-            .map(|pin| {
-                let kind_page = match pin.kind {
-                    PinKind::Album => Page::Album,
-                    PinKind::Artist => Page::Artist,
-                    PinKind::Playlist => Page::Playlist,
-                };
-                let selected = route.page == kind_page && route.id.as_deref() == Some(pin.id.as_str());
-                let cover = state.update(cx, |s, cx| s.cover(pin.cover_art.as_deref(), 60, cx));
-                let fallback = match pin.kind {
-                    PinKind::Album => "disc3",
-                    PinKind::Artist => "mic2",
-                    PinKind::Playlist => "list-music",
-                };
-                let leading = match cover {
-                    Some(image) => div()
-                        .size(sz(21.0))
-                        .flex_none()
-                        .rounded(sz(if pin.kind == PinKind::Artist { 11.0 } else { 3.0 }))
-                        .bg(tokens.surface)
-                        .child(img(image).size_full().rounded(sz(if pin.kind == PinKind::Artist { 11.0 } else { 3.0 })))
-                        .into_any_element(),
-                    None => nav_icon(fallback, tokens),
-                };
-                let key = pin_key(&pin);
-                let group = SharedString::from(format!("pin-{key}"));
-                let (open_state, unpin_state) = (state.clone(), state.clone());
-                let target = crate::app_state::Route { page: kind_page, id: Some(pin.id.clone()), title: Some(pin.name.clone()) };
-                let unpin = pin.clone();
-                let open = row(SharedString::from(format!("pin-open-{key}")), leading, pin.name.clone().into(), selected, collapsed, tokens)
-                    .flex_1()
-                    .min_w_0()
-                    .on_click(move |_, _, cx| {
-                        let target = target.clone();
-                        open_state.update(cx, |s, cx| s.navigate(target, cx));
-                    });
-                let mut item = div()
-                    .id(SharedString::from(format!("pin-{key}")))
-                    .group(group.clone())
-                    .flex()
-                    .items_center()
-                    .gap(sz(2.0))
-                    .child(open);
-                if !collapsed {
-                    item = item.child(
-                        div().flex_none().opacity(0.0).group_hover(group, |s| s.opacity(1.0)).child(
-                            crate::components::ui::IconButton::new(
-                                SharedString::from(format!("unpin-{key}")),
-                                format!("Unpin {}", pin.name),
-                                icon_with("x", 13.0, None, false),
+
+    let rows_for = |id: &'static str, items: Vec<Pin>, cx: &mut App| -> AnyElement {
+        let (state, tokens, route, added) = (state.clone(), tokens.clone(), route.clone(), added.clone());
+        let total = items.len();
+        crate::components::virtual_rows::virtual_rows_with(id, scroll_handle, total, ROW_PITCH, 3.0, cx, move |range, cx| {
+            range
+                .map(|index| {
+                    let pin = &items[index];
+                    let kind_page = match pin.kind {
+                        PinKind::Album => Page::Album,
+                        PinKind::Artist => Page::Artist,
+                        PinKind::Playlist => Page::Playlist,
+                    };
+                    let selected = route.page == kind_page && route.id.as_deref() == Some(pin.id.as_str());
+                    let cover = state.update(cx, |s, cx| s.cover(pin.cover_art.as_deref(), 60, cx));
+                    let fallback = match pin.kind {
+                        PinKind::Album => "disc3",
+                        PinKind::Artist => "mic2",
+                        PinKind::Playlist => "list-music",
+                    };
+                    let leading = match cover {
+                        Some(image) => div()
+                            .size(sz(21.0))
+                            .flex_none()
+                            .rounded(sz(if pin.kind == PinKind::Artist { 11.0 } else { 3.0 }))
+                            .bg(tokens.surface)
+                            .child(img(image).size_full().rounded(sz(if pin.kind == PinKind::Artist { 11.0 } else { 3.0 })))
+                            .into_any_element(),
+                        None => nav_icon(fallback, &tokens),
+                    };
+                    let key = pin_key(pin);
+                    let group = SharedString::from(format!("pin-{key}"));
+                    let (open_state, unpin_state) = (state.clone(), state.clone());
+                    let target = crate::app_state::Route {
+                        page: kind_page,
+                        id: Some(pin.id.clone()),
+                        title: Some(pin.name.clone()),
+                    };
+                    let unpin = pin.clone();
+                    let open = row(SharedString::from(format!("pin-open-{key}")), leading, pin.name.clone().into(), selected, collapsed, &tokens)
+                        .flex_1()
+                        .min_w_0()
+                        .on_click(move |_, _, cx| {
+                            let target = target.clone();
+                            open_state.update(cx, |s, cx| s.navigate(target, cx));
+                        });
+                    let mut item = div()
+                        .id(SharedString::from(format!("pin-{key}")))
+                        .group(group.clone())
+                        .flex()
+                        .items_center()
+                        .gap(sz(2.0))
+                        .child(open);
+                    if !collapsed {
+                        item = item.child(
+                            div().flex_none().opacity(0.0).group_hover(group, |s| s.opacity(1.0)).child(
+                                crate::components::ui::IconButton::new(
+                                    SharedString::from(format!("unpin-{key}")),
+                                    format!("Unpin {}", pin.name),
+                                    icon_with("x", 13.0, None, false),
+                                )
+                                .size(22.0)
+                                .on_click(move |_, _, cx| {
+                                    let pin = unpin.clone();
+                                    unpin_state.update(cx, |s, cx| s.toggle_pin(pin, cx));
+                                }),
+                            ),
+                        );
+                    }
+                    // `pin-added-pop` (520 ms): the scale is not drawable, the fade is.
+                    match added.as_ref().filter(|(k, at)| *k == key && at.elapsed() < std::time::Duration::from_millis(520) && !crate::components::motion::reduced()) {
+                        Some(_) => item
+                            .with_animation(
+                                SharedString::from(format!("pin-pop-{key}")),
+                                gpui::Animation::new(std::time::Duration::from_millis(520))
+                                    .with_easing(crate::components::motion::cubic_bezier(0.2, 0.8, 0.2, 1.0)),
+                                |el, t| el.opacity(0.65 + 0.35 * (t / 0.68).min(1.0)),
                             )
-                            .size(22.0)
-                            .on_click(move |_, _, cx| {
-                                let pin = unpin.clone();
-                                unpin_state.update(cx, |s, cx| s.toggle_pin(pin, cx));
-                            }),
-                        ),
-                    );
-                }
-                // `pin-added-pop` (520 ms): the scale is not drawable, the fade is.
-                match added.as_ref().filter(|(k, at)| *k == key && at.elapsed() < std::time::Duration::from_millis(520) && !crate::components::motion::reduced()) {
-                    Some(_) => item
-                        .with_animation(
-                            SharedString::from(format!("pin-pop-{key}")),
-                            gpui::Animation::new(std::time::Duration::from_millis(520))
-                                .with_easing(crate::components::motion::cubic_bezier(0.2, 0.8, 0.2, 1.0)),
-                            |el, t| el.opacity(0.65 + 0.35 * (t / 0.68).min(1.0)),
-                        )
-                        .into_any_element(),
-                    None => item.into_any_element(),
-                }
-            })
-            .collect()
+                            .into_any_element(),
+                        None => item.into_any_element(),
+                    }
+                })
+                .collect()
+        })
     };
+
     let mut out = Vec::new();
     if separate {
-        for (kind, title) in [(PinKind::Album, "Pinned Albums"), (PinKind::Artist, "Pinned Artists"), (PinKind::Playlist, "Pinned Playlists")] {
+        for (kind, title, id) in [
+            (PinKind::Album, "Pinned Albums", "sidebar-pins-albums"),
+            (PinKind::Artist, "Pinned Artists", "sidebar-pins-artists"),
+            (PinKind::Playlist, "Pinned Playlists", "sidebar-pins-playlists"),
+        ] {
             let items: Vec<Pin> = pins.iter().filter(|p| p.kind == kind).cloned().collect();
             if !items.is_empty() {
                 out.push(heading(title, collapsed, tokens));
-                out.extend(rows_for(items, cx));
+                out.push(rows_for(id, items, cx));
             }
         }
     } else {
         out.push(heading("Pinned", collapsed, tokens));
-        out.extend(rows_for(pins, cx));
+        out.push(rows_for("sidebar-pins", pins, cx));
     }
     out
 }
