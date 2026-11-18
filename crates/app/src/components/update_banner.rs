@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{AnyElement, App, AppContext, BoxShadow, Context, Entity, IntoElement, ParentElement, Styled, deferred, div, point, prelude::*, px};
 use volta_logic::storage as keys;
-use volta_logic::update::{check_due, is_newer};
+use volta_logic::update::{Channel, check_due, platform_name, update_available};
 
 use crate::app_state::AppState;
 use crate::components::connection_banner::Connection;
@@ -37,7 +37,9 @@ impl AppState {
         }
         self.update_checking = true;
         cx.notify();
-        let task = cx.background_spawn(async move { volta_services::update::latest_release() });
+        let channel = Channel::from_stored(&self.storage.get(keys::UPDATE_CHANNEL_KEY));
+        log::info!("update check ({}): channel {}", if manual { "manual" } else { "automatic" }, channel.id());
+        let task = cx.background_spawn(async move { volta_services::update::latest_release(channel) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |state, cx| {
@@ -45,8 +47,10 @@ impl AppState {
                 match result {
                     Ok(release) => {
                         state.storage.set(keys::UPDATE_LAST_CHECK_KEY, &now_ms().to_string());
-                        match release.filter(|r| is_newer(env!("CARGO_PKG_VERSION"), &r.version)) {
+                        let build = (crate::build_info::VERSION, crate::build_info::GIT_SHA, crate::build_info::build_unix());
+                        match release.filter(|r| update_available(build.0, build.1, build.2, r)) {
                             Some(release) => {
+                                log::info!("update available: {}", release.version);
                                 let skipped = state.storage.get(keys::UPDATE_SKIPPED_KEY) == release.version;
                                 // An explicit "Check now" shows a skipped version again.
                                 if manual || !skipped {
@@ -55,14 +59,23 @@ impl AppState {
                             }
                             None => {
                                 state.update = None;
+                                log::info!("no update available");
                                 if manual {
-                                    state.notify(format!("Volta {} is up to date.", env!("CARGO_PKG_VERSION")), NoticeKind::Info, cx);
+                                    let message = match channel {
+                                        Channel::Stable => format!("Volta {} is up to date.", env!("CARGO_PKG_VERSION")),
+                                        Channel::Nightly => "You have the latest nightly.".to_string(),
+                                    };
+                                    state.notify(message, NoticeKind::Info, cx);
                                 }
                             }
                         }
                     }
-                    Err(_) if manual => state.notify("Couldn’t check for updates.", NoticeKind::Error, cx),
-                    Err(_) => {}
+                    Err(error) => {
+                        log::warn!("update check failed: {error}");
+                        if manual {
+                            state.notify("Couldn’t check for updates.", NoticeKind::Error, cx);
+                        }
+                    }
                 }
                 cx.notify();
             });
@@ -88,7 +101,16 @@ pub fn render(state: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
     let tokens = theme::tokens(cx).clone();
     let viewport = theme::viewport(cx);
     let (later, skip) = (state.clone(), state.clone());
-    let url = release.url.clone();
+    // Nightlies link straight to this platform's download; stable opens the release page.
+    let (url, button) = match release.asset_for(&platform_name()) {
+        Some(asset) => (asset.url.clone(), "Download"),
+        None if release.channel == Channel::Nightly => (release.url.clone(), "View build"),
+        None => (release.url.clone(), "View release"),
+    };
+    let message = match release.channel {
+        Channel::Stable => format!("Volta {} is available (you have {}).", release.version, crate::build_info::VERSION),
+        Channel::Nightly => format!("A newer nightly is available ({}; you have {}).", release.version, crate::build_info::commit_label()),
+    };
     Some(
         deferred(
             div().absolute().top(sz(10.0)).left_0().right_0().flex().justify_center().child(
@@ -116,12 +138,8 @@ pub fn render(state: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
                     }])
                     .text_color(tokens.secondary)
                     .text_size(sz(11.0))
-                    .child(div().flex_1().min_w_0().child(format!(
-                        "Volta {} is available (you have {}).",
-                        release.version,
-                        env!("CARGO_PKG_VERSION")
-                    )))
-                    .child(secondary_button("update-view", "View release", "", cx).min_h(sz(27.0)).py(sz(5.0)).px(sz(11.0)).text_size(sz(11.0)).on_click(
+                    .child(div().flex_1().min_w_0().child(message))
+                    .child(secondary_button("update-view", button, "", cx).min_h(sz(27.0)).py(sz(5.0)).px(sz(11.0)).text_size(sz(11.0)).on_click(
                         move |_, _, cx| cx.open_url(&url),
                     ))
                     .child(secondary_button("update-skip", "Skip", "", cx).min_h(sz(27.0)).py(sz(5.0)).px(sz(11.0)).text_size(sz(11.0)).on_click(

@@ -37,7 +37,8 @@ pub struct PlaybackDock {
 }
 
 /// The wheel's volume step in percent: the "Volume scroll step" settings
-/// (Shift selects the large step).
+/// (Alt/Option or Ctrl selects the large step; Shift can't, because the OS
+/// turns Shift+wheel into a horizontal scroll and the vertical delta is lost).
 pub(crate) fn volume_scroll_step(state: &Entity<AppState>, shift: bool, cx: &gpui::App) -> f64 {
     let storage = &state.read(cx).storage;
     let (key, fallback) = if shift {
@@ -260,8 +261,7 @@ impl PlaybackDock {
                 if delta == 0.0 {
                     return;
                 }
-                // Shift selects the large step (Ctrl+wheel is page zoom on the web).
-                let step = this.scroll_step(event.modifiers.shift, cx);
+                let step = this.scroll_step(event.modifiers.alt || event.modifiers.control, cx);
                 let direction = if delta > 0.0 { 1.0 } else { -1.0 };
                 this.player.update(cx, |player, cx| {
                     let next = ((player.volume + direction * step / 100.0) * 100.0).round() / 100.0;

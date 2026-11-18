@@ -12,6 +12,7 @@ pub mod interactions;
 pub mod js;
 pub mod learned_ranker;
 pub mod library;
+pub mod library_stats;
 pub mod listening_history;
 pub mod listening_stats;
 pub mod local_music;

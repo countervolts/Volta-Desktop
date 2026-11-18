@@ -34,6 +34,10 @@ pub struct Learning {
     listening_signature: (usize, String),
     pub ranker: RankerModel,
     impressions: Vec<PendingImpression>,
+    /// What `record_impressions` last logged (30-minute bucket, account, slate), so the
+    /// per-frame Home render does not re-read and re-parse the engagement log to find
+    /// nothing new.
+    impression_stamp: Option<(i64, String, String, usize)>,
     rewarded: HashSet<String>,
     pub tuning: RecommendationTuning,
     /// The cached Home slate and the inputs it was ranked from.
@@ -439,12 +443,20 @@ impl AppState {
     /// (`observeRecommendationVisibility`). Native has no intersection
     /// observer, so a rendered shelf counts every slot as seen.
     pub fn record_impressions(&mut self) {
-        if !self.learning_enabled() || self.learning.slate.is_empty() {
+        if self.learning.slate.is_empty() {
             return;
         }
         let Some((engagement_key, _, impression_key)) = self.learning_keys() else { return };
         let now = now_ms();
         let bucket = (now / (30.0 * 60.0 * 1000.0)).floor() as i64;
+        let stamp = (bucket, engagement_key.clone(), self.learning.slate_signature.clone(), self.learning.slate.len());
+        if self.learning.impression_stamp.as_ref() == Some(&stamp) {
+            return;
+        }
+        if !self.learning_enabled() {
+            return;
+        }
+        self.learning.impression_stamp = Some(stamp);
         let mut events = read_engagement(&self.lget(&engagement_key), now);
         let known: HashSet<String> = events.iter().map(|e| e.id.clone()).collect();
         let mut added = Vec::new();

@@ -2,6 +2,7 @@
 
 pub mod local;
 pub mod lrclib;
+pub mod metrics;
 pub mod musicbrainz;
 pub mod navidrome;
 pub mod share;

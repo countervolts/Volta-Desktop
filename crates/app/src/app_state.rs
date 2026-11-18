@@ -261,6 +261,13 @@ pub struct AppState {
     pub last_snapshot: String,
     pub stats_period: volta_logic::listening_stats::StatsPeriod,
     pub stats_offset: i32,
+    /// "listening" | "library".
+    pub stats_tab: &'static str,
+    /// The accent colour picker in Settings, created when first shown.
+    pub accent_picker: Option<Entity<gpui_component::color_picker::ColorPickerState>>,
+    /// Whole-library totals, keyed by the source they were computed for.
+    pub library_stats: Option<(String, Result<volta_logic::library_stats::LibraryStats, String>)>,
+    pub library_stats_loading: bool,
     /// Folders: the tree for the loaded songs and the browser state.
     pub folder_tree: Option<std::sync::Arc<volta_logic::folder_tree::FolderTree>>,
     pub folder_path: String,
@@ -334,7 +341,7 @@ pub enum ConnectOutcome {
 }
 
 /// `<data dir>/artwork-cache`.
-fn artwork_cache_dir() -> Option<std::path::PathBuf> {
+pub(crate) fn artwork_cache_dir() -> Option<std::path::PathBuf> {
     volta_services::storage::data_dir().map(|dir| dir.join("artwork-cache"))
 }
 
@@ -490,6 +497,10 @@ impl AppState {
             update_checking: false,
             stats_period: volta_logic::listening_stats::StatsPeriod::Week,
             stats_offset: 0,
+            stats_tab: "listening",
+            accent_picker: None,
+            library_stats: None,
+            library_stats_loading: false,
             folder_tree: None,
             folder_path: String::new(),
             folder_clear_search: false,
@@ -509,6 +520,19 @@ impl AppState {
             filter: String::new(),
         };
         state.restore_session(cx);
+        // UI heartbeat for the stall watchdog, and a state snapshot every 10 s.
+        cx.spawn(async move |this, cx| {
+            let mut ticks = 0u32;
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+                crate::logs::heartbeat();
+                ticks += 1;
+                if ticks.is_multiple_of(10) && this.update(cx, |state, cx| state.log_snapshot(cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         // Never phone home from screenshot runs or when explicitly disabled.
         if std::env::var_os("VOLTA_SHOT").is_none() && std::env::var_os("VOLTA_NO_UPDATE_CHECK").is_none() {
             state.check_for_updates(false, cx);
@@ -555,6 +579,9 @@ impl AppState {
         }
         self.record_route_engagement(&route);
         self.reset_selection();
+        if route.page == Page::Stats {
+            crate::components::charts::replay_entrances();
+        }
         self.history.push(route);
         self.mobile_sidebar = false;
         self.filter.clear();
@@ -632,15 +659,23 @@ impl AppState {
         self.connecting = true;
         self.connect_error.clear();
         cx.notify();
+        let connect_started = std::time::Instant::now();
+        log::info!("connecting to {server} (restoring a saved session: {restoring})");
         let task = cx.background_spawn(async move { connect_blocking(&server, &username, &password, auth) });
         cx.spawn(async move |this, cx| {
             let outcome = task.await;
             let _ = this.update(cx, |state, cx| {
                 state.connecting = false;
                 state.auth_ready = true;
+                crate::logs::timed("connect", connect_started);
                 match outcome {
-                    ConnectOutcome::Ok(client) => state.connected(client, remember, cx),
+                    ConnectOutcome::Ok(client) => {
+                        log::info!("connected to {}", client.server);
+                        crate::logs::mark("connected");
+                        state.connected(client, remember, cx)
+                    }
                     ConnectOutcome::Err(message) => {
+                        log::warn!("connection failed: {message}");
                         if restoring {
                             // A persisted token can expire while the app is closed.
                             state.storage.remove(keys::REMEMBERED_CREDENTIALS_KEY);
@@ -1453,10 +1488,12 @@ impl AppState {
             return;
         }
         if self.is_local() {
+            let started = std::time::Instant::now();
             self.page = std::rc::Rc::new(if route.page == Page::Search { self.local_search(&self.search_debounced) } else { self.local_page_data(&route) });
             if route.page == Page::Folders {
                 self.folder_tree = Some(std::sync::Arc::new(volta_logic::folder_tree::build_folder_tree(&self.page.songs)));
             }
+            self.log_page_load(route.page.name(), "local", started);
             self.page_loading = false;
             self.page_error = None;
             self.reset_paging();
@@ -1531,6 +1568,7 @@ impl AppState {
                 .collect()
         };
         let (memory_key, session_key, route_page) = (load_key, cache_key, route.page);
+        let load_started = std::time::Instant::now();
         let task = cx.background_spawn(async move {
             let id = route.id.clone().unwrap_or_default();
             let mut data = PageData::default();
@@ -1599,6 +1637,7 @@ impl AppState {
                 match result {
                     Ok(data) => {
                         state.page = data.into();
+                        state.log_page_load(route_page.name(), "server", load_started);
                         state.reset_paging();
                         if route_page != Page::Folders && route_page != Page::Search {
                             state.page_memory.shift_remove(&memory_key);
@@ -1606,8 +1645,10 @@ impl AppState {
                             while state.page_memory.len() > 2 {
                                 state.page_memory.shift_remove_index(0);
                             }
+                            let saving = std::time::Instant::now();
                             let json = serde_json::json!({"savedAt": volta_logic::listening_history::now_ms(), "data": &state.page}).to_string();
                             state.storage.session_set(&session_key, &json);
+                            log::info!(target: crate::logs::PERF, "page cache write ({}): {} KB, {:.0} ms", route_page.name(), json.len() / 1024, saving.elapsed().as_secs_f64() * 1000.0);
                         }
                         if state.route().page == Page::Folders {
                             state.folder_tree = Some(std::sync::Arc::new(volta_logic::folder_tree::build_folder_tree(&state.page.songs)));
@@ -1627,12 +1668,31 @@ impl AppState {
                             }
                         }
                     }
-                    Err(error) => state.page_error = Some(error.to_string()),
+                    Err(error) => {
+                        log::warn!("page {} failed to load: {error}", route_page.name());
+                        state.page_error = Some(error.to_string())
+                    }
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// One performance line per page load: how long, and how much arrived.
+    /// Page size against load time is what shows a library growing too big.
+    fn log_page_load(&self, page: &str, source: &str, started: std::time::Instant) {
+        let p = &self.page;
+        log::info!(
+            target: crate::logs::PERF,
+            "page load: {page} from {source}: {:.0} ms | {} songs, {} albums, {} artists, {} playlists",
+            started.elapsed().as_secs_f64() * 1000.0,
+            p.songs.len(),
+            p.albums.len(),
+            p.artists.len(),
+            p.playlists.len(),
+        );
+        crate::logs::mark("first page loaded");
     }
 
     /// Folder browser navigation (`goTo` with Back / Forward history).
@@ -1882,8 +1942,13 @@ impl AppState {
         let task: gpui::Task<Option<RenderImage>> = if let Some(path) = id.strip_prefix("local-file:") {
             let path = path.to_string();
             let thumbs = artwork_cache_dir();
+            let started = std::time::Instant::now();
             let decoded = crate::covers::run(move || crate::covers::load_local(&path, max_side, thumbs.as_deref()));
-            cx.background_spawn(async move { decoded.await.ok().flatten() })
+            cx.background_spawn(async move {
+                let image = decoded.await.ok().flatten();
+                crate::logs::cover_loaded(started.elapsed(), false, image.is_some());
+                image
+            })
         } else {
             // Server artwork is kept on disk (the web's Cache Storage), keyed
             // by server, cover id and size.
@@ -1893,10 +1958,16 @@ impl AppState {
                 dir.join(format!("{hash:016x}"))
             });
             cx.background_spawn(async move {
+                let started = std::time::Instant::now();
+                let mut from_network = false;
                 let bytes = match disk.as_ref().and_then(|path| std::fs::read(path).ok()) {
                     Some(bytes) => bytes,
                     None => {
-                        let bytes = client.cover_bytes(&id, Some(size)).ok()?;
+                        from_network = true;
+                        let Ok(bytes) = client.cover_bytes(&id, Some(size)) else {
+                            crate::logs::cover_loaded(started.elapsed(), true, false);
+                            return None;
+                        };
                         if let Some(path) = disk.as_ref() {
                             let _ = std::fs::create_dir_all(path.parent().unwrap_or(path));
                             let _ = std::fs::write(path, &bytes);
@@ -1904,7 +1975,7 @@ impl AppState {
                         bytes
                     }
                 };
-                crate::covers::run(move || {
+                let image = crate::covers::run(move || {
                     // SVG covers are rasterized here, with system fonts (svg_raster).
                     let bytes = if crate::components::svg_raster::is_svg(&bytes) {
                         crate::components::svg_raster::render_png(&bytes, max_side).unwrap_or(bytes)
@@ -1915,7 +1986,9 @@ impl AppState {
                 })
                 .await
                 .ok()
-                .flatten()
+                .flatten();
+                crate::logs::cover_loaded(started.elapsed(), from_network, image.is_some());
+                image
             })
         };
         cx.spawn(async move |this, cx| {
@@ -1999,3 +2072,37 @@ pub struct GlobalStorage(pub Storage);
 pub struct GlobalPlaying(pub bool);
 impl gpui::Global for GlobalPlaying {}
 impl gpui::Global for GlobalStorage {}
+
+impl AppState {
+    /// Applies a new accent colour everywhere and remembers it.
+    pub fn set_accent(&mut self, accent: crate::theme::Accent, cx: &mut Context<Self>) {
+        if cx.global::<crate::theme::ThemeState>().accent == accent {
+            return;
+        }
+        log::info!("accent colour: {}", accent.to_stored());
+        self.storage.set(keys::ACCENT_KEY, &accent.to_stored());
+        {
+            let theme = cx.global_mut::<crate::theme::ThemeState>();
+            theme.accent = accent;
+            theme.refresh();
+        }
+        crate::theme::apply(cx);
+    }
+
+    /// The Settings colour picker, created (and wired to [`AppState::set_accent`]) on first use.
+    pub fn accent_picker(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> Entity<gpui_component::color_picker::ColorPickerState> {
+        if let Some(picker) = &self.accent_picker {
+            return picker.clone();
+        }
+        let current = cx.global::<crate::theme::ThemeState>().accent.swatch();
+        let picker = cx.new(|cx| gpui_component::color_picker::ColorPickerState::new(window, cx).default_value(current));
+        cx.subscribe(&picker, |state, _, event: &gpui_component::color_picker::ColorPickerEvent, cx| {
+            if let gpui_component::color_picker::ColorPickerEvent::Change(Some(color)) = event {
+                state.set_accent(crate::theme::Accent::from_hsla(*color), cx);
+            }
+        })
+        .detach();
+        self.accent_picker = Some(picker.clone());
+        picker
+    }
+}

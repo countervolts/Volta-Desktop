@@ -1285,14 +1285,14 @@ float4 fill_color(Background background,
 // One effect runs as: (source) -> downsample into scratch A -> horizontal
 // Gaussian A -> B -> vertical Gaussian B -> A -> composite A into the frame.
 
-// Must match `VoltaEffectParams` in metal_renderer.rs (128 bytes).
+// Must match `VoltaEffectParams` in metal_renderer.rs (304 bytes).
 struct VoltaEffectParams {
   float4 region;       // blurred source region, frame px: x, y, width, height
   float2 scratch_size; // scratch texels covered by the downsampled region
   float2 texture_size; // size of the source and scratch textures
   float downsample;
   float sigma;         // Gaussian standard deviation, in scratch texels
-  uint kind;           // 0 backdrop blur, 1 layer blur, 2 layer shadow
+  uint kind;           // 0 backdrop blur, 1 layer blur, 2 layer shadow, 3 glass
   float saturation;
   float4 bounds;       // where the result is drawn, frame px
   float4 content_mask;
@@ -1300,7 +1300,10 @@ struct VoltaEffectParams {
   float4 color;        // shadow tint, premultiplied
   float2 offset;       // shadow offset
   float opacity;
-  float pad;
+  float outset;        // glass only: how far the quad extends beyond bounds
+  // Glass only: `GlassParams` as eleven float4s, in field order: tint, optics, blur, tone,
+  // light, rim, shadow, state, pointer, edge, finish.
+  float4 glass[11];
 };
 
 struct VoltaEffectPassOutput {
@@ -1436,4 +1439,324 @@ fragment float4 volta_effect_composite_fragment(VoltaEffectPassOutput input [[st
     return blurred * effect.opacity;
   }
   return effect.color * blurred.a * effect.opacity;
+}
+
+// Liquid Glass: a port of `fs_glass` (gpui-pre-wgpu shaders_effects.wgsl, and the HLSL port in
+// gpui-pre-windows). The backdrop copy (texture 0, sharp) and its blur (texture 1) are both
+// sampled: refracted sharp taps at the rim, frosted blur inside. The frame holds
+// gamma-encoded values; the optics work in linear light.
+
+constant float3 GLASS_LUMA = float3(0.2126, 0.7152, 0.0722);
+
+float glass_dither(float2 position) {
+  float noise = fract(52.9829189 * fract(dot(position, float2(0.06711056, 0.00583715))));
+  return (noise - 0.5) / 255.0;
+}
+
+float glass_pick_radius(float2 p, float4 radii) {
+  // radii: top-left, top-right, bottom-right, bottom-left.
+  if (p.x < 0.) {
+    return p.y < 0. ? radii.x : radii.w;
+  }
+  return p.y < 0. ? radii.y : radii.z;
+}
+
+float glass_sdf(float2 p, float2 half_size, float4 radii, float n) {
+  float r = min(glass_pick_radius(p, radii), min(half_size.x, half_size.y));
+  float2 q = abs(p) - half_size + r;
+  float2 outside_q = max(q, 0.0);
+  float outside = length(outside_q);
+  if (r > 0.0 && n > 2.0) {
+    outside = pow(pow(outside_q.x, n) + pow(outside_q.y, n), 1.0 / n);
+  }
+  return outside + min(max(q.x, q.y), 0.0) - r;
+}
+
+float2 glass_normal(float2 p, float2 half_size, float4 radii, float n, float min_radius) {
+  float e = 0.75;
+  float4 soft = max(radii, float4(min_radius));
+  float2 gradient = float2(
+      glass_sdf(p + float2(e, 0.0), half_size, soft, n) - glass_sdf(p - float2(e, 0.0), half_size, soft, n),
+      glass_sdf(p + float2(0.0, e), half_size, soft, n) - glass_sdf(p - float2(0.0, e), half_size, soft, n));
+  float len = length(gradient);
+  return len > 1e-6 ? gradient / len : float2(0.0, -1.0);
+}
+
+float3 glass_sharp(texture2d<float> sharp, constant VoltaEffectParams &effect, float2 position) {
+  constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+  float2 lo = effect.region.xy + 0.5;
+  float2 hi = effect.region.xy + effect.region.zw - 0.5;
+  float2 uv = clamp(position, lo, hi) / effect.texture_size;
+  return srgb_to_linear(sharp.sample(s, uv, level(0)).rgb);
+}
+
+float3 glass_blurred(texture2d<float> blurred, constant VoltaEffectParams &effect, float2 position) {
+  constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+  float2 scratch = (position - effect.region.xy) / effect.downsample;
+  float2 uv = clamp(scratch, float2(0.5), effect.scratch_size - 0.5) / effect.texture_size;
+  return srgb_to_linear(blurred.sample(s, uv, level(0)).rgb);
+}
+
+float glass_bezel_slope(float u) {
+  float a = 1.0 - u;
+  float a3 = a * a * a;
+  float f = max(1.0 - a3 * a, 1e-4);
+  return a3 / pow(f, 0.75);
+}
+
+vertex VoltaEffectPassOutput volta_effect_glass_vertex(uint vertex_id [[vertex_id]],
+                                                       uint instance_id [[instance_id]],
+                                                       constant VoltaEffectParams *effects [[buffer(0)]],
+                                                       constant float2 *viewport_size [[buffer(1)]]) {
+  VoltaEffectParams effect = effects[instance_id];
+  float2 unit_vertex = float2(float(vertex_id & 1u), float((vertex_id >> 1) & 1u));
+  float2 origin = effect.bounds.xy - effect.outset;
+  float2 size = effect.bounds.zw + effect.outset * 2.0;
+  float2 position = origin + unit_vertex * size;
+  VoltaEffectPassOutput out;
+  out.position = float4(position / *viewport_size * float2(2., -2.) + float2(-1., 1.), 0., 1.);
+  out.effect_id = instance_id;
+  return out;
+}
+
+// Output is premultiplied; the pipeline blends One, OneMinusSourceAlpha.
+fragment float4 volta_effect_glass_fragment(VoltaEffectPassOutput input [[stage_in]],
+                                            constant VoltaEffectParams *effects [[buffer(0)]],
+                                            texture2d<float> sharp [[texture(0)]],
+                                            texture2d<float> blurred_tex [[texture(1)]]) {
+  constant VoltaEffectParams &effect = effects[input.effect_id];
+  float2 frag = input.position.xy;
+  float4 mask = effect.content_mask;
+  if (frag.x < mask.x || frag.y < mask.y || frag.x > mask.x + mask.z || frag.y > mask.y + mask.w) {
+    return float4(0.0);
+  }
+  float4 g_tint = effect.glass[0];
+  float4 g_optics = effect.glass[1];
+  float4 g_blur = effect.glass[2];
+  float4 g_tone = effect.glass[3];
+  float4 g_light = effect.glass[4];
+  float4 g_rim = effect.glass[5];
+  float4 g_shadow = effect.glass[6];
+  float4 g_state = effect.glass[7];
+  float4 g_pointer = effect.glass[8];
+  float4 g_edge = effect.glass[9];
+  float4 g_finish = effect.glass[10];
+
+  float4 radii = effect.corner_radii;
+  float2 half_size = effect.bounds.zw * 0.5;
+  float2 mid_point = effect.bounds.xy + half_size;
+  float2 p = frag - mid_point;
+  float min_half = min(half_size.x, half_size.y);
+  float largest_radius = max(max(radii.x, radii.y), max(radii.z, radii.w));
+  float corner_exponent = mix(max(g_state.x, 2.0), 2.0,
+                              smoothstep(0.8, 0.98, largest_radius / max(min_half, 1.0)));
+  float sdf = glass_sdf(p, half_size, radii, corner_exponent);
+  float appear = clamp(g_state.z, 0.0, 1.0) * effect.opacity;
+  float coverage = clamp(0.5 - sdf, 0.0, 1.0);
+
+  float shadow_alpha = 0.0;
+  if (g_shadow.z > 0.0) {
+    float sigma = max(g_shadow.y * 0.5, 0.5);
+    float shadow_sdf = glass_sdf(p - float2(0.0, g_shadow.x), half_size + g_shadow.w, radii, corner_exponent);
+    float falloff = 0.5 * (1.0 - tanh(1.2028 * shadow_sdf / (sigma * 1.41421356)));
+    float size_factor = clamp(min_half * 2.0 / (sigma * 3.0), 0.2, 1.0);
+    shadow_alpha = g_shadow.z * falloff * size_factor * (1.0 - coverage) * appear;
+  }
+  if (g_edge.z > 0.0) {
+    shadow_alpha += g_edge.z * exp(-max(sdf, 0.0) / 1.4) * (1.0 - coverage) * appear;
+  }
+  if (sdf > 0.5) {
+    return float4(0.0, 0.0, 0.0, shadow_alpha > 0.0 ? max(shadow_alpha + glass_dither(frag), 0.0) : 0.0);
+  }
+
+  float depth = max(-sdf, 0.0);
+  float bezel = clamp(g_optics.y, 1.0, max(min_half * 0.98, 1.0));
+  float2 normal = glass_normal(p, half_size, radii, corner_exponent, bezel);
+
+  float refraction_amount = g_optics.x * appear;
+  float ior = max(g_optics.z, 1.02);
+  float2 refract_offset = float2(0.0);
+  if (depth < bezel && refraction_amount != 0.0) {
+    float u = clamp(depth / bezel, 0.0, 1.0);
+    float slope = glass_bezel_slope(u) * g_optics.w / bezel;
+    float3 surface_normal = normalize(float3(normal * slope, 1.0));
+    float3 refracted = refract(float3(0.0, 0.0, -1.0), surface_normal, 1.0 / ior);
+    float tan_slope = length(refracted.xy) / max(-refracted.z, 1e-3);
+    float sine_limit = 1.0 / ior;
+    float tangent_limit = sine_limit / sqrt(1.0 - sine_limit * sine_limit);
+    refract_offset = -normal * (clamp(tan_slope / tangent_limit, 0.0, 1.0) * refraction_amount);
+  }
+
+  float2 sample_position = frag + refract_offset;
+  float dispersion = g_blur.z;
+  float3 color = glass_sharp(sharp, effect, sample_position);
+  if (dispersion != 0.0) {
+    color = float3(glass_sharp(sharp, effect, frag + refract_offset * (1.0 - dispersion)).r,
+                   color.g,
+                   glass_sharp(sharp, effect, frag + refract_offset * (1.0 + dispersion)).b);
+  }
+  float blur_radius = g_blur.x * appear;
+  if (blur_radius > 0.5) {
+    float3 blurred = glass_blurred(blurred_tex, effect, sample_position);
+    float blur_mix = mix(g_blur.y, 1.0, smoothstep(0.0, bezel * 1.5, depth));
+    color = mix(color, blurred, blur_mix);
+  }
+
+  float appearance = g_tone.w;
+  if (appearance < 0.0) {
+    float region_luma = dot(glass_blurred(blurred_tex, effect, mid_point), GLASS_LUMA);
+    float region_gamma_luma = linear_to_srgb(float3(region_luma)).x;
+    appearance = 1.0 - smoothstep(0.28, 0.62, region_gamma_luma);
+  }
+
+  float3 encoded = linear_to_srgb(max(color, 0.0));
+  float3 untoned = encoded;
+  encoded = (encoded - 0.5) * g_tone.y + 0.5;
+  encoded = encoded * g_tone.x;
+  float3 veil_color = mix(float3(1.0), float3(0.06), appearance);
+  encoded = mix(encoded, veil_color, g_tone.z);
+  float encoded_luma = dot(encoded, GLASS_LUMA);
+  encoded = mix(float3(encoded_luma), encoded, g_blur.w);
+  encoded = clamp(encoded, 0.0, 1.0);
+
+  if (g_tint.a > 0.0) {
+    float brightness = clamp(dot(encoded, GLASS_LUMA), 0.0, 1.0);
+    float3 tinted = g_tint.rgb * mix(0.45, 1.25, brightness);
+    encoded = mix(encoded, clamp(tinted, 0.0, 1.0), clamp(g_tint.a, 0.0, 1.0) * 0.9);
+  }
+  if (g_edge.x > 0.0) {
+    float band = exp(-depth / max(g_edge.y, 0.5)) * g_edge.x * (1.0 - appearance);
+    encoded = encoded * (1.0 - clamp(band, 0.0, 0.9));
+  }
+  encoded = mix(untoned, encoded, appear);
+
+  float2 light_0 = float2(cos(g_light.x), -sin(g_light.x));
+  float2 light_1 = float2(cos(g_light.y), -sin(g_light.y));
+  float facing_0 = pow(max(dot(normal, light_0), 0.0), g_rim.z);
+  float facing_1 = pow(max(dot(normal, light_1), 0.0), g_rim.z);
+  float lit_amount = clamp(facing_0 * g_light.z + facing_1 * g_light.w, 0.0, 1.5);
+  float rim_width = max(g_rim.x, 0.25);
+  float3 channel_shift = float3(-1.0, 0.0, 1.0) * g_edge.w;
+  float3 rim_profile = exp(-pow(max(depth + channel_shift, 0.0) / rim_width, float3(g_rim.y)));
+  float bevel = exp(-depth / max(g_finish.z, 0.5)) * g_finish.y * lit_amount;
+  float3 rim_energy = clamp((g_finish.x + lit_amount) * rim_profile + bevel, 0.0, 1.0) * appear;
+  float3 face_hue = encoded / max(max(encoded.r, max(encoded.g, encoded.b)), 0.08);
+  float3 rim_light = mix(float3(1.0), face_hue, 0.55);
+  encoded = 1.0 - (1.0 - encoded) * (1.0 - rim_energy * rim_light);
+
+  if (g_pointer.z > 0.0 && g_pointer.w > 0.0) {
+    float pointer_distance = length(frag - (effect.bounds.xy + g_pointer.xy));
+    float glow_radius = g_pointer.z * 0.5;
+    encoded += g_pointer.w * 0.2 * exp(-(pointer_distance * pointer_distance) / (2.0 * glow_radius * glow_radius));
+  }
+
+  float3 output_encoded = clamp(encoded, 0.0, 1.0) + glass_dither(frag);
+  return float4(output_encoded * coverage, coverage + shadow_alpha);
+}
+
+// Full-screen player background (`BlurEffectKind::CoverBackground`), the GPU version of
+// the CPU compositor that used to live in the app (fullscreen_background.rs): rotating copies of a
+// cover blurred by ~104 css px, colour-graded, veiled. One effect runs as
+//   scene pass  -> scratch A  (this evaluates every square analytically per texel)
+//   gaussian    -> A -> B -> A (the shared passes above)
+//   composite   -> frame      (grade + veil, rounded corners)
+// Parameters are carried in `VoltaEffectParams`:
+//   region      virtual scene origin (frame px, bleeds 35 % past the bounds) and size
+//   bounds      where the background is drawn (the viewport)
+//   glass[0]    seconds, fade, -, -
+//   glass[1]    canvas rgb
+//   glass[2]/[3] atlas rect (x, y, w, h in texels) of the cover / previous cover; w = 0: none
+
+float2 cover_rotate(float2 v, float degrees) {
+  float angle = degrees * 0.017453292519943295;
+  float s = sin(angle);
+  float c = cos(angle);
+  return float2(c * v.x - s * v.y, s * v.x + c * v.y);
+}
+
+float cover_turn(float seconds, float period, float direction) {
+  return fract(seconds / period) * 360.0 * direction;
+}
+
+// Composites one cover over `c` (premultiplied source-over) wherever the rotated square
+// centred at `centre`, `size` wide, covers `pos`.
+float3 cover_square(float3 c, texture2d<float> tex, float4 rect, float opacity, float2 pos,
+                    float2 centre, float size, float degrees) {
+  constexpr sampler tile_sampler(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+  float2 local = cover_rotate(pos - centre, -degrees) / size + 0.5;
+  if (local.x < 0.0 || local.y < 0.0 || local.x > 1.0 || local.y > 1.0) {
+    return c;
+  }
+  float2 texel = clamp(rect.xy + local * rect.zw, rect.xy + 0.5, rect.xy + rect.zw - 0.5);
+  float4 src = tex.sample(tile_sampler, texel / float2(tex.get_width(), tex.get_height()), level(0));
+  return src.rgb * opacity + c * (1.0 - src.a * opacity);
+}
+
+float3 cover_layer(float3 c, texture2d<float> tex, float4 rect, float opacity, float2 pos,
+                   float2 view, float2 bleed, float2 buffer, float t) {
+  if (rect.z <= 0.0 || opacity <= 0.0) {
+    return c;
+  }
+  float w = view.x;
+  float h = view.y;
+  // `.fullscreen-cover`: inset -35 %, object-fit cover.
+  c = cover_square(c, tex, rect, opacity, pos, buffer * 0.5, max(buffer.x, buffer.y), 0.0);
+  c = cover_square(c, tex, rect, opacity, pos, bleed + float2(0.5 * w, 0.5 * h), 1.25 * w, cover_turn(t, 69.813, 1.0));
+  c = cover_square(c, tex, rect, opacity, pos, bleed + float2(0.4 * w, 0.4 * h), 0.8 * w, cover_turn(t, 26.18, -1.0));
+  // Orbits: W x W squares centred vertically, turning about a pivot.
+  float orbit_top = bleed.y + h / 2.0 - w / 2.0;
+  float2 pivot_a = float2(0.5 * w, 0.5 * w);
+  float2 point_a = pivot_a + cover_rotate(float2(0.25 * w, 0.0), cover_turn(t, 46.542, -1.0));
+  c = cover_square(c, tex, rect, opacity, pos, float2(bleed.x + point_a.x, orbit_top + point_a.y), 0.5 * w,
+                   cover_turn(t, 34.907, 1.0));
+  float2 pivot_b = float2(0.55 * w, 0.55 * w);
+  float2 point_b = pivot_b + cover_rotate(float2(0.25 * w, 0.0), cover_turn(t, 69.813, 1.0));
+  c = cover_square(c, tex, rect, opacity, pos, float2(bleed.x + point_b.x, orbit_top + point_b.y), 0.25 * w,
+                   cover_turn(t, 52.36, -1.0));
+  return c;
+}
+
+fragment float4 volta_cover_scene_fragment(VoltaEffectPassOutput input [[stage_in]],
+                                           constant VoltaEffectParams *effects [[buffer(0)]],
+                                           texture2d<float> cover_tex [[texture(0)]],
+                                           texture2d<float> previous_tex [[texture(1)]]) {
+  constant VoltaEffectParams &effect = effects[input.effect_id];
+  // Scene position in frame px relative to the virtual origin; the texel centre of the
+  // downsampled grid.
+  float2 pos = input.position.xy * effect.downsample;
+  float2 view = effect.bounds.zw;
+  float2 bleed = view * 0.35;
+  float2 buffer = effect.region.zw;
+  float seconds = effect.glass[0].x;
+  float fade = clamp(effect.glass[0].y, 0.0, 1.0);
+  float3 c = effect.glass[1].rgb;
+  if (fade < 1.0) {
+    c = cover_layer(c, previous_tex, effect.glass[3], 1.0, pos, view, bleed, buffer, seconds);
+  }
+  c = cover_layer(c, cover_tex, effect.glass[2], fade, pos, view, bleed, buffer, seconds);
+  return float4(c, 1.0);
+}
+
+fragment float4 volta_cover_composite_fragment(VoltaEffectPassOutput input [[stage_in]],
+                                               constant VoltaEffectParams *effects [[buffer(0)]],
+                                               texture2d<float> source [[texture(0)]]) {
+  VoltaEffectParams effect = effects[input.effect_id];
+  float2 p = input.position.xy;
+  float4 mask = effect.content_mask;
+  if (p.x < mask.x || p.y < mask.y || p.x > mask.x + mask.z || p.y > mask.y + mask.w) {
+    return float4(0.);
+  }
+  float2 scratch = (p - effect.region.xy) / effect.downsample;
+  float3 rgb = volta_effect_sample(source, scratch, float2(0.5), effect.scratch_size - 0.5,
+                                   effect.texture_size).rgb;
+  // The feColorMatrix grade, then a 50 % black veil and a 5 % white lift.
+  float3 graded = clamp(float3(
+      dot(rgb, float3(3.162853, -1.6652724, -0.1678308)) - 0.315,
+      dot(rgb, float3(-0.4946469, 1.9922276, -0.1678308)) - 0.315,
+      dot(rgb, float3(-0.4946469, -1.6652724, 3.489669)) - 0.315), 0., 1.);
+  graded = graded * 0.5 * 0.95 + 0.05;
+  graded += (fract(52.9829189 * fract(dot(p, float2(0.06711056, 0.00583715)))) - 0.5) / 255.0;
+  float sdf = volta_rounded_rect_sdf(p, effect.bounds, effect.corner_radii);
+  float coverage = saturate(0.5 - sdf) * effect.opacity;
+  return float4(saturate(graded) * coverage, coverage);
 }

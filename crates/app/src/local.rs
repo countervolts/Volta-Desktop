@@ -57,8 +57,13 @@ impl AppState {
         self.local.busy = true;
         self.local.error = None;
         cx.notify();
-        let cache = read_cache(&self.storage.get(LOCAL_METADATA_KEY));
+        let loading = std::time::Instant::now();
+        let raw_cache = self.storage.get(LOCAL_METADATA_KEY);
+        let cache = read_cache(&raw_cache);
         let overrides = read_overrides(&self.storage.get(LOCAL_OVERRIDES_KEY));
+        log::info!(target: crate::logs::PERF, "local metadata cache read: {} entries, {} KB, {:.0} ms", cache.len(), raw_cache.len() / 1024, loading.elapsed().as_secs_f64() * 1000.0);
+        log::info!("scanning local folder {}", root.display());
+        let scan_started = std::time::Instant::now();
         let task = cx.background_spawn(async move {
             if !root.is_dir() {
                 return Err(root);
@@ -72,8 +77,19 @@ impl AppState {
                 match result {
                     Ok((root, scan)) => {
                         state.storage.set(LOCAL_DIRECTORY_KEY, &root.to_string_lossy());
-                        state.storage.set(LOCAL_METADATA_KEY, &serde_json::to_string(&scan.cache).unwrap_or_default());
+                        let saving = std::time::Instant::now();
+                        let json = serde_json::to_string(&scan.cache).unwrap_or_default();
+                        state.storage.set(LOCAL_METADATA_KEY, &json);
+                        log::info!(target: crate::logs::PERF, "local metadata cache saved: {} entries, {} KB, {:.0} ms", scan.cache.len(), json.len() / 1024, saving.elapsed().as_secs_f64() * 1000.0);
                         let library = scan.library;
+                        log::info!(
+                            "local library ready: {} tracks, {} albums, {} artists",
+                            library.tracks.len(),
+                            library.albums.len(),
+                            library.artists.len()
+                        );
+                        crate::logs::timed("local library load (scan + save)", scan_started);
+                        crate::logs::mark("local library ready");
                         let message = if library.tracks.is_empty() {
                             format!("No supported audio files found in {}.", library.directory_name)
                         } else {
@@ -91,6 +107,7 @@ impl AppState {
                         }
                     }
                     Err(_) => {
+                        log::warn!("local folder could not be read");
                         state.local.error = Some("That folder could not be read. Choose it again.".into());
                         state.auth_ready = true;
                     }

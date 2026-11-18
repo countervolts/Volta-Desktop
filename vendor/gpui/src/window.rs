@@ -9,7 +9,7 @@ use crate::subscription::SingleSubscriberSet;
 use crate::taffy::TaffyLayoutEngine;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BlurEffect, BlurEffectKind,
+    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BlurEffect, BlurEffectKind, CoverScene,
     BorderStyle, Bounds, BoxShadow, ElementFilter, GlassParams, SceneFilter, blur_extent,
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
@@ -4812,6 +4812,7 @@ impl Window {
             offset: Point::default(),
             layer: 0,
             glass: GlassParams::default(),
+            cover: None,
         });
     }
 
@@ -4850,7 +4851,66 @@ impl Window {
             offset: Point::default(),
             layer: 0,
             glass: params,
+            cover: None,
         });
+    }
+
+    /// Modified for Volta: paints the full-screen player background on the GPU: rotating
+    /// copies of `cover` (and `previous`, while it fades out), blurred by `blur_radius` and
+    /// colour-graded. Currently implemented by the Metal renderer only.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_cover_background(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        blur_radius: Pixels,
+        cover: Option<Arc<RenderImage>>,
+        previous: Option<Arc<RenderImage>>,
+        fade: f32,
+        seconds: f32,
+        canvas: [f32; 3],
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+        let opacity = self.element_opacity();
+        if opacity <= 0. {
+            return Ok(());
+        }
+        let scale_factor = self.scale_factor();
+        let bounds = self.snap_bounds(bounds);
+        let tile = |image: Option<Arc<RenderImage>>| -> Result<Option<AtlasTile>> {
+            let Some(data) = image else { return Ok(None) };
+            let params = RenderImageParams { image_id: data.id, frame_index: 0 };
+            self.sprite_atlas.get_or_insert_with(params.into(), &mut || {
+                Ok(Some((
+                    data.size(0),
+                    Cow::Borrowed(data.as_bytes(0).expect("frame 0 exists")),
+                )))
+            })
+        };
+        let cover = tile(cover)?;
+        let previous = tile(previous)?;
+        if cover.is_none() && previous.is_none() {
+            return Ok(());
+        }
+        self.next_frame.scene.insert_primitive(BlurEffect {
+            order: 0,
+            kind: BlurEffectKind::CoverBackground,
+            bounds,
+            sample_bounds: bounds,
+            content_mask: self.snapped_content_mask(),
+            corner_radii: corner_radii.scale(scale_factor),
+            blur_radius: ScaledPixels(blur_radius.0 * scale_factor),
+            saturation: 1.,
+            opacity,
+            color: Hsla::default(),
+            offset: Point::default(),
+            layer: 0,
+            glass: GlassParams::default(),
+            cover: Some(CoverScene { cover, previous, fade, seconds, canvas }),
+        });
+        Ok(())
     }
 
     /// Modified for Volta: paint everything `f` paints through `filter`, like CSS

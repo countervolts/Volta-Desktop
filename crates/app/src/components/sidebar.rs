@@ -7,6 +7,7 @@ use gpui::{
 };
 use gpui_component::tooltip::Tooltip;
 
+use crate::components::window_chrome;
 use crate::app_state::{AppState, Page, Route};
 use crate::components::ui::{IconButton, icon_with};
 use crate::theme::{self, Tokens, mix, sz, transparent};
@@ -256,6 +257,8 @@ pub fn render(state: &Entity<AppState>, _window: &mut Window, cx: &mut App) -> i
         .overflow_y_scroll()
         .flex()
         .flex_col()
+        // A little air between rows so two highlighted rows never fuse into one block.
+        .gap(sz(3.0))
         .children(items(&PRIMARY))
         .child(heading("Library", collapsed, &tokens))
         .children(items(&LIBRARY))
@@ -344,7 +347,7 @@ pub fn render(state: &Entity<AppState>, _window: &mut Window, cx: &mut App) -> i
         .flex()
         .flex_col()
         .min_h_0()
-        .pt(sz(17.0))
+        .pt(sz(17.0 + window_chrome::traffic_light_inset()))
         .px(sz(12.0 - 3.0 * motion.rail))
         .pb(sz(9.0))
         .overflow_hidden()

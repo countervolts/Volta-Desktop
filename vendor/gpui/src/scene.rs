@@ -124,6 +124,26 @@ pub enum BlurEffectKind {
     /// `glass`, and draw its rim light and outside shadow. The backdrop is captured
     /// and blurred like [`Self::BackdropBlur`].
     Glass,
+    /// The full-screen player background: rotating copies of a cover, blurred and
+    /// colour-graded, drawn on the GPU from `cover` (Metal only for now; the other
+    /// renderers treat it like [`Self::BackdropBlur`] and callers must not use it there).
+    CoverBackground,
+}
+
+/// Modified for Volta: the scene a [`BlurEffectKind::CoverBackground`] effect draws.
+/// Everything is positioned in units of the effect's width, so only `bounds` sets the scale.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CoverScene {
+    /// The current cover (atlas tile), if decoded yet.
+    pub cover: Option<AtlasTile>,
+    /// The cover fading out, while `fade` < 1.
+    pub previous: Option<AtlasTile>,
+    /// Opacity of `cover` over `previous`.
+    pub fade: f32,
+    /// Animation clock, in seconds.
+    pub seconds: f32,
+    /// Colour the scene starts from (sRGB, 0..1).
+    pub canvas: [f32; 3],
 }
 
 /// Modified for Volta: optical parameters of a Liquid Glass surface, grouped in
@@ -239,6 +259,8 @@ pub struct BlurEffect {
     pub layer: usize,
     /// Glass only: the material, in device pixels (see [`GlassParams::scaled`]).
     pub glass: GlassParams,
+    /// Cover background only.
+    pub cover: Option<CoverScene>,
 }
 
 /// Modified for Volta: where a renderer runs one [`BlurEffect`]'s passes.
@@ -403,6 +425,7 @@ impl Scene {
             offset,
             layer: active.layer,
             glass: GlassParams::default(),
+            cover: None,
         });
     }
 

@@ -38,11 +38,19 @@ pub const LOGIN_DRAFT_KEY: &str = "volta-login-draft";
 pub const LOCAL_SOURCE_MODE_KEY: &str = "volta-source-mode";
 pub const SEARCH_HISTORY_KEY: &str = "volta-search-history";
 pub const SHARE_PROVIDER_KEY: &str = "volta-share-provider";
+/// Native-only: accent colour id (default "red").
+pub const ACCENT_KEY: &str = "volta-accent";
 pub const FRAME_MONITOR_KEY: &str = "volta-frame-monitor";
+/// Native-only: frame rate of the full-screen player background (default 60).
+pub const FULLSCREEN_FPS_KEY: &str = "volta-fullscreen-fps";
+/// Native-only: "true" lets gpui cap an unfocused window at ~30 fps (default off).
+pub const BACKGROUND_FPS_LIMIT_KEY: &str = "volta-background-fps-limit";
 /// Native-only: "true" opens the developer console window at launch.
 pub const CONSOLE_AT_STARTUP_KEY: &str = "volta-console-at-startup";
 /// Native-only: "false" turns the daily release check off.
 pub const UPDATE_CHECK_KEY: &str = "volta-update-check";
+/// "stable" (default) or "nightly".
+pub const UPDATE_CHANNEL_KEY: &str = "volta-update-channel";
 pub const UPDATE_SKIPPED_KEY: &str = "volta-update-skipped-version";
 pub const UPDATE_LAST_CHECK_KEY: &str = "volta-update-last-check";
 pub const REWARD_WINDOW_MS: u64 = 6 * 60 * 60 * 1000;

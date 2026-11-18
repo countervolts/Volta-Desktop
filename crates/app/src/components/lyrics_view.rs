@@ -127,7 +127,7 @@ impl LyricsView {
             self._fetch = None;
             return;
         };
-        let external = self.state.read(cx).storage.get(volta_logic::storage::EXTERNAL_LYRICS_KEY) == "true";
+        let external = self.state.read(cx).storage.get(volta_logic::storage::EXTERNAL_LYRICS_KEY) != "false";
         // Local files have no server to ask: a sidecar .lrc, clipboard import, or LRCLIB
         // when external lookup is on.
         let local = song.is_local();

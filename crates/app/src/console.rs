@@ -26,10 +26,18 @@ struct Tee(env_logger::Logger);
 
 impl log::Log for Tee {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        self.0.enabled(metadata)
+        self.0.enabled(metadata) || crate::logs::file_enabled(metadata.target(), metadata.level())
     }
 
     fn log(&self, record: &log::Record) {
+        // Every record that passes the file filter goes to disk, whatever the terminal shows.
+        if crate::logs::file_enabled(record.target(), record.level()) {
+            crate::logs::write(record);
+        }
+        // Performance lines live in performance.log only.
+        if record.target() == crate::logs::PERF {
+            return;
+        }
         if self.0.matches(record) {
             push(Line {
                 level: record.level(),
@@ -41,15 +49,19 @@ impl log::Log for Tee {
 
     fn flush(&self) {
         self.0.flush();
+        crate::logs::flush();
     }
 }
 
 /// Installs the logger: terminal output as before, plus the capture buffer.
 pub fn init_logger() {
     let inner = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,volta=info,volta_audio=info")).build();
-    let max = inner.filter();
+    // The files want debug detail from Volta even though the terminal doesn't.
+    let max = inner.filter().max(log::LevelFilter::Debug);
+    crate::logs::start();
     if log::set_boxed_logger(Box::new(Tee(inner))).is_ok() {
         log::set_max_level(max);
+        crate::logs::write_system_report();
     }
 }
 

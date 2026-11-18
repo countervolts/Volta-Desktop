@@ -15,6 +15,16 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 const SCHEMA_VERSION: i64 = 1;
 
+/// The SQLite library bundled into this build.
+pub fn sqlite_version() -> &'static str {
+    rusqlite::version()
+}
+
+/// The database layout version Volta writes.
+pub fn schema_version() -> i64 {
+    SCHEMA_VERSION
+}
+
 #[derive(Clone)]
 pub struct Storage {
     db: Arc<Mutex<Option<Connection>>>,

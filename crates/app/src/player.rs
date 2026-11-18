@@ -78,6 +78,8 @@ pub struct Player {
     pub original: bool,
     pub normalization: Normalization,
     pub error: Option<String>,
+    /// When the current load was requested, for the time-to-first-audio metric.
+    load_started: Option<std::time::Instant>,
     next_token: u64,
     current_token: u64,
     preloaded: Option<(u64, usize)>,
@@ -148,6 +150,7 @@ impl Player {
             original: true,
             normalization: Normalization::Off,
             error: None,
+            load_started: None,
             next_token: 1,
             current_token: 0,
             preloaded: None,
@@ -394,6 +397,17 @@ impl Player {
         self.error = None;
         self.preloaded = None;
         let song = self.queue[index].clone();
+        log::info!(
+            "play: \"{}\" by {} [{} {} {}] from {}, start {:.1}s, autoplay {autoplay}",
+            song.title,
+            song.artist.as_deref().unwrap_or("unknown"),
+            song.suffix.as_deref().or(song.codec.as_deref()).unwrap_or("?"),
+            song.bit_rate.map(|b| format!("{b:.0} kbps")).unwrap_or_default(),
+            song.sampling_rate.map(|r| format!("{:.1} kHz", r / 1000.0)).unwrap_or_default(),
+            if song.is_local() { "this device" } else { "server" },
+            start_at,
+        );
+        self.load_started = Some(std::time::Instant::now());
         let (session_id, session_index) = self.ensure_session();
         self.listen = Some(Listen {
             token: request.token,
@@ -868,6 +882,13 @@ impl Player {
                 }
                 Event::Started { token } if token == self.current_token => {
                     self.loading = false;
+                    if let Some(started) = self.load_started.take() {
+                        let what = format!(
+                            "time to first audio ({})",
+                            self.current_song().map(|s| if s.is_local() { "local file" } else { "streamed" }).unwrap_or("?")
+                        );
+                        crate::logs::timed(&what, started);
+                    }
                     let song_id = self.current_song().filter(|s| !s.is_local()).map(|s| s.id.clone());
                     if let Some(listen) = self.listen.as_mut().filter(|l| !l.announced) {
                         listen.announced = true;
@@ -915,15 +936,18 @@ impl Player {
                         }
                 }
                 Event::Ended { token } if token == self.current_token => {
+                    log::debug!("playback ended (end of queue)");
                     self.playing = false;
                     self.position = self.duration;
                     self.finish_listen(EventKind::Complete, "ended", cx);
                 }
                 Event::FellBack { token } if token == self.current_token => {
+                    log::warn!("the original stream failed to decode; falling back to the compatible stream");
                     self.compatible = true;
                 }
                 Event::Error { token, message }
                     if (token == self.current_token || token == 0) => {
+                        log::error!("playback error: {message} (song: {})", self.current_song().map(|s| s.title.as_str()).unwrap_or("none"));
                         self.finish_listen(EventKind::Stop, "playback-error", cx);
                         self.loading = false;
                         self.playing = false;

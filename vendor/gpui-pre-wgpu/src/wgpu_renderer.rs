@@ -1942,7 +1942,7 @@ impl WgpuRendererCore {
         };
 
         match effect.kind {
-            BlurEffectKind::BackdropBlur | BlurEffectKind::Glass => {
+            BlurEffectKind::BackdropBlur | BlurEffectKind::Glass | BlurEffectKind::CoverBackground => {
                 let (Some(frame_texture), Some(textures)) =
                     (frame_texture, self.resources().effect_textures.as_ref())
                 else {
@@ -2060,13 +2060,14 @@ impl WgpuRendererCore {
         for effect in &scene.effects {
             let plan = gpui::plan_blur_effect(effect, frame_width, frame_height);
             let kind = match effect.kind {
-                BlurEffectKind::BackdropBlur => 0,
+                // CoverBackground is Metal-only: if it ever arrives here, it draws as a backdrop blur.
+                BlurEffectKind::BackdropBlur | BlurEffectKind::CoverBackground => 0,
                 BlurEffectKind::LayerBlur => 1,
                 BlurEffectKind::LayerShadow => 2,
                 BlurEffectKind::Glass => 3,
             };
             // Backdrop effects (blur, glass) copy the frame; layer effects draw a layer.
-            let backdrop = matches!(effect.kind, BlurEffectKind::BackdropBlur | BlurEffectKind::Glass);
+            let backdrop = matches!(effect.kind, BlurEffectKind::BackdropBlur | BlurEffectKind::Glass | BlurEffectKind::CoverBackground);
             let usable = (!backdrop || frame_copyable) && (backdrop || effect.layer < scene.filter_layers.len());
             let plan = plan.filter(|_| usable);
             plans.push(plan.map(|plan| EffectPlan {

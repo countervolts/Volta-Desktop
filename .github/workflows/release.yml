@@ -9,7 +9,12 @@
 # The tag must match the version in Cargo.toml (`[workspace.package] version`),
 # because the in-app update check compares the release tag with that version.
 # Tags containing a "-" (v0.2.0-beta.1) are published as pre-releases, which the
-# update check ignores.
+# stable update channel ignores.
+#
+# Nightlies are the artifacts of a successful build of main (see the Actions tab).
+# The app's Nightly update channel compares its own commit with the newest
+# successful run of this workflow on main. Binaries are built with
+# VOLTA_CHANNEL=nightly (tags: stable) so Settings > About can say which they are.
 name: Release
 
 on:
@@ -60,6 +65,9 @@ jobs:
           - { name: macos-x86_64, os: macos-15-intel }
           - { name: windows-x86_64, os: windows-latest }
     runs-on: ${{ matrix.os }}
+    env:
+      # Shown in Settings > About.
+      VOLTA_CHANNEL: ${{ startsWith(github.ref, 'refs/tags/v') && 'stable' || 'nightly' }}
     steps:
       - uses: actions/checkout@v4
         with:

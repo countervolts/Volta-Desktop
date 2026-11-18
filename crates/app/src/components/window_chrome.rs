@@ -60,6 +60,20 @@ pub fn client_side(window: &Window) -> bool {
         || (cfg!(any(target_os = "linux", target_os = "freebsd")) && matches!(window.window_decorations(), Decorations::Client { .. }))
 }
 
+/// macOS hides the native title bar too (`appears_transparent`) but keeps the
+/// OS traffic lights and resize frame, so only a drag area is added.
+pub const MACOS: bool = cfg!(target_os = "macos");
+
+/// Extra top space (logical px) that keeps content clear of the traffic lights.
+pub fn traffic_light_inset() -> f32 {
+    if MACOS { 24.0 } else { 0.0 }
+}
+
+/// Whether the app provides the drag area (client-side frame, or macOS).
+pub fn custom_titlebar(window: &Window) -> bool {
+    MACOS || client_side(window)
+}
+
 /// `volta-warn-before-leave`: closing while music plays asks first. Returns
 /// whether the window may close now; otherwise a prompt is shown and the
 /// window closes itself if "Leave" is chosen.
@@ -179,6 +193,17 @@ pub fn controls(window: &Window) -> AnyElement {
 /// the toolbar (`floating_controls`), a drag strip and the window controls in
 /// the top-right corner.
 pub fn frame(content: AnyElement, floating_controls: bool, window: &Window) -> AnyElement {
+    if MACOS {
+        if !floating_controls {
+            return content;
+        }
+        return div()
+            .relative()
+            .size_full()
+            .child(content)
+            .child(drag_area(div().id("window-drag-strip").absolute().top_0().left_0().right_0().h(sz(20.0))))
+            .into_any_element();
+    }
     if !client_side(window) {
         return content;
     }

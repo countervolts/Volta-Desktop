@@ -1,4 +1,5 @@
-//! `FullscreenBackground` from player-ui.tsx, composited on the CPU.
+//! `FullscreenBackground` from player-ui.tsx. Composited on the GPU on macOS (see
+//! [`FullscreenBackground::render_gpu`]), on the CPU elsewhere.
 //!
 //! The web scene: a bleed copy of the cover (inset −35 %) plus four squares
 //! of it — 1.25W at (0.5W, 0.5H), 0.8W at (0.4W, 0.4H), 0.5W orbiting
@@ -21,6 +22,44 @@ use tiny_skia::{FilterQuality, Pixmap, PixmapPaint, Transform};
 
 use crate::app_state::AppState;
 use crate::theme;
+
+/// Whether this platform's renderer draws the background itself (`paint_cover_background`).
+fn gpu() -> bool {
+    cfg!(target_os = "macos") && std::env::var_os("VOLTA_CPU_BG").is_none()
+}
+
+/// A cover pixmap (premultiplied RGBA) as a GPU image (BGRA).
+fn pixmap_image(pixmap: &Pixmap) -> Arc<RenderImage> {
+    let mut rgba = image::RgbaImage::new(pixmap.width(), pixmap.height());
+    for (dst, src) in rgba.pixels_mut().zip(pixmap.pixels()) {
+        dst.0 = [src.blue(), src.green(), src.red(), src.alpha()];
+    }
+    Arc::new(RenderImage::new(vec![image::Frame::new(rgba)]))
+}
+
+/// Keeps `slot` in step with `source`, dropping the stale texture.
+fn sync_gpu_image(slot: &mut Option<(usize, Arc<RenderImage>)>, source: &Option<Arc<Pixmap>>, cx: &mut gpui::App) {
+    let key = source.as_ref().map(|p| Arc::as_ptr(p) as usize);
+    if slot.as_ref().map(|(k, _)| *k) == key {
+        return;
+    }
+    if let Some((_, stale)) = slot.take() {
+        cx.drop_image(stale, None);
+    }
+    if let (Some(key), Some(pixmap)) = (key, source) {
+        *slot = Some((key, pixmap_image(pixmap)));
+    }
+}
+
+/// Frame rate of the background (Settings > Appearance), shared with the settings page.
+static FPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(60);
+
+/// Applies a stored frame-rate value ("15", "30", "60", ...); anything else keeps the current one.
+pub fn set_fps(value: &str) {
+    if let Ok(fps) = value.trim().parse::<u32>() {
+        FPS.store(fps.clamp(5, 240), std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// `FULLSCREEN_ARTWORK_FADE_MS`.
 const FADE: f32 = 1.7;
@@ -243,6 +282,14 @@ pub struct FullscreenBackground {
     started: Instant,
     size: (f32, f32),
     rendering: bool,
+    /// macOS: the covers as GPU textures, keyed by the pixmap they were made from.
+    gpu_cover: Option<(usize, Arc<RenderImage>)>,
+    gpu_previous: Option<(usize, Arc<RenderImage>)>,
+    /// Frame pacing: when the last frame rendered, the shortest gap seen between frames (the
+    /// display's refresh interval), and the timer that wakes the view for the next one.
+    last_render: Option<Instant>,
+    min_gap: f32,
+    frame_timer: Option<Task<()>>,
     _load: Option<Task<()>>,
 }
 
@@ -253,7 +300,8 @@ fn corners_are_square(cx: &gpui::App) -> bool {
 }
 
 impl FullscreenBackground {
-    pub fn new(state: Entity<AppState>, _cx: &mut Context<Self>) -> Self {
+    pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        set_fps(&state.read(cx).storage.get(volta_logic::storage::FULLSCREEN_FPS_KEY));
         Self {
             state,
             frame: None,
@@ -268,6 +316,11 @@ impl FullscreenBackground {
             started: Instant::now(),
             size: (1440.0, 900.0),
             rendering: false,
+            gpu_cover: None,
+            gpu_previous: None,
+            last_render: None,
+            min_gap: f32::INFINITY,
+            frame_timer: None,
             _load: None,
         }
     }
@@ -322,6 +375,10 @@ impl FullscreenBackground {
             self.load_cover(cover_id, cx);
         }
         self.seed_from_cache(cx);
+        // macOS draws the scene on the GPU in `render_gpu`; nothing to rasterise here.
+        if gpu() {
+            return;
+        }
         // Without a cover the scene is only the graded canvas colour, which is black: show
         // the base grey instead until a cover has decoded.
         if self.rendering || (self.cover.is_none() && self.previous.is_none()) {
@@ -368,6 +425,92 @@ impl FullscreenBackground {
 
 impl Render for FullscreenBackground {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_inner(window, cx)
+    }
+}
+
+impl FullscreenBackground {
+    /// The macOS path: the renderer draws, blurs and grades the scene itself, so a frame costs
+    /// only a handful of parameters on the CPU.
+    fn render_gpu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        sync_gpu_image(&mut self.gpu_cover, &self.cover, cx);
+        sync_gpu_image(&mut self.gpu_previous, &self.previous, cx);
+        let cover = self.gpu_cover.as_ref().map(|(_, image)| image.clone());
+        let previous = self.gpu_previous.as_ref().map(|(_, image)| image.clone());
+        if cover.is_some() && self.shown_at.is_none() {
+            self.shown_at = Some(Instant::now());
+        }
+        let fade_in = self.shown_at.map_or(0.0, |at| (at.elapsed().as_secs_f32() / 0.5).clamp(0.0, 1.0));
+        let fade = match self.fade_started {
+            Some(start) if self.previous.is_some() => start.elapsed().as_secs_f32() / FADE,
+            _ => 1.0,
+        };
+        // `FULLSCREEN_REDUCED_MOTION_SCALE`.
+        let seconds = self.started.elapsed().as_secs_f32() * if crate::components::motion::reduced() { 0.2 } else { 1.0 };
+        let rgba = gpui::Rgba::from(theme::tokens(cx).canvas);
+        let canvas = [rgba.r, rgba.g, rgba.b];
+        let scale = f32::from(window.rem_size()) / 16.0;
+        let corners = cx.try_global::<crate::components::window_chrome::WindowCorners>().map(|c| c.0).unwrap_or_default();
+        div()
+            .absolute()
+            .inset_0()
+            .overflow_hidden()
+            .bg(gpui::rgb(0x242426))
+            .map(|d| crate::components::window_chrome::window_corners(d, cx))
+            .child(
+                div().absolute().inset_0().opacity(fade_in).child(
+                    gpui::canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            let _ = window.paint_cover_background(
+                                bounds,
+                                corners,
+                                gpui::px(BLUR_SIGMA * scale),
+                                cover.clone(),
+                                previous.clone(),
+                                fade,
+                                seconds,
+                                canvas,
+                            );
+                        },
+                    )
+                    .absolute()
+                    .size_full(),
+                ),
+            )
+    }
+
+    /// Asks for the next frame at the chosen rate. At or above the display's refresh rate that
+    /// is every display frame; below it, a timer wakes the view so the whole window is not
+    /// laid out and painted for frames that would look the same.
+    fn request_next_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        if let Some(last) = self.last_render.replace(now) {
+            let gap = now.duration_since(last).as_secs_f32();
+            if gap > 0.002 {
+                self.min_gap = self.min_gap.min(gap);
+            }
+        }
+        let target = 1.0 / FPS.load(std::sync::atomic::Ordering::Relaxed).max(1) as f32;
+        if !self.min_gap.is_finite() || target <= self.min_gap * 1.3 {
+            window.request_animation_frame();
+            return;
+        }
+        if self.frame_timer.is_some() {
+            return;
+        }
+        // Wake a little before the frame that should draw, so it lands on the right vsync.
+        let wait = (target - self.min_gap * 0.6).max(0.001);
+        self.frame_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_secs_f32(wait)).await;
+            let _ = this.update(cx, |view, cx| {
+                view.frame_timer = None;
+                cx.notify();
+            });
+        }));
+    }
+
+    fn render_inner(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let viewport = crate::theme::content_size(window);
         let scale = f32::from(window.rem_size()) / 16.0;
         self.size = (f32::from(viewport.width) / scale, f32::from(viewport.height) / scale);
@@ -376,7 +519,10 @@ impl Render for FullscreenBackground {
         // shows the newest finished one. The web renders at 15 fps; native
         // runs at the refresh rate.
         self.tick(cx);
-        window.request_animation_frame();
+        self.request_next_frame(window, cx);
+        if gpu() {
+            return self.render_gpu(window, cx).into_any_element();
+        }
         // The first frame fades in from the base grey rather than popping in.
         if self.frame.is_some() && self.shown_at.is_none() {
             self.shown_at = Some(Instant::now());
@@ -414,6 +560,7 @@ impl Render for FullscreenBackground {
                         .opacity(fade_in),
                 )
             })
+            .into_any_element()
     }
 }
 

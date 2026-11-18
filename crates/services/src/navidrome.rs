@@ -151,6 +151,18 @@ impl Navidrome {
     }
 
     fn request<T: DeserializeOwned>(&self, endpoint: &str, query: &[(&str, String)]) -> Result<T> {
+        let started = std::time::Instant::now();
+        let result = self.request_inner(endpoint, query);
+        if !self.is_offline() {
+            crate::metrics::record_request(endpoint, started.elapsed(), result.is_ok());
+        }
+        if let Err(error) = &result {
+            log::warn!("request {endpoint} failed: {error}");
+        }
+        result
+    }
+
+    fn request_inner<T: DeserializeOwned>(&self, endpoint: &str, query: &[(&str, String)]) -> Result<T> {
         if self.is_offline() {
             return Err(NavidromeError::Other("Not available for music on this device.".into()));
         }
@@ -414,6 +426,7 @@ impl Navidrome {
     /// `allAlbums`: every album, paged by `alphabeticalByName` (500 a page),
     /// deduped by id; stops when a page adds nothing new.
     pub fn all_albums(&self) -> Result<Vec<AlbumRecord>> {
+        let started = std::time::Instant::now();
         let page_size = 500u32;
         let mut seen = std::collections::HashSet::new();
         let mut albums = Vec::new();
@@ -438,15 +451,19 @@ impl Navidrome {
             }
             offset += page_size;
         }
+        log::info!(target: "perf", "fetched all albums: {} albums, {:.0} ms", albums.len(), started.elapsed().as_secs_f64() * 1000.0);
         Ok(albums)
     }
 
     pub fn all_songs(&self, page_size: u32, max: Option<usize>) -> Result<Vec<Song>> {
+        let started = std::time::Instant::now();
+        let mut pages = 0u32;
         let mut seen = std::collections::HashSet::new();
         let mut songs = Vec::new();
         let mut offset = 0u32;
         while max.is_none_or(|m| songs.len() < m) {
             let page = self.songs(offset, page_size)?;
+            pages += 1;
             if page.is_empty() {
                 break;
             }
@@ -471,6 +488,7 @@ impl Navidrome {
         if let Some(max) = max {
             songs.truncate(max);
         }
+        log::info!(target: "perf", "fetched all songs: {} songs in {pages} requests of {page_size}, {:.0} ms", songs.len(), started.elapsed().as_secs_f64() * 1000.0);
         Ok(songs)
     }
 

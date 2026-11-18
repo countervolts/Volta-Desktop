@@ -12,14 +12,16 @@ use crate::components::ui::{icon, icon_with};
 use crate::theme::{self, Tokens, mix, sz, transparent};
 use crate::views::library::secondary_button;
 
-pub const TABS: [(&str, &str, &str); 9] = [
+pub const TABS: [(&str, &str, &str); 11] = [
     ("appearance", "Appearance", "palette"),
     ("playback", "Playback", "audio-lines"),
+    ("performance", "Performance", "gauge"),
     ("privacy", "Privacy", "shield-check"),
     ("sharing", "Sharing", "share2"),
     ("keyboard", "Keyboard", "keyboard"),
     ("help", "Help", "life-buoy"),
     ("account", "Account", "circle-user-round"),
+    ("about", "About", "info"),
     ("developer", "Developer", "flask-conical"),
     ("diagnostics", "Diagnostics", "gauge"),
 ];
@@ -189,8 +191,12 @@ fn pref(state: &Entity<AppState>, key: &str, cx: &App) -> String {
 }
 
 fn set_pref(state: &Entity<AppState>, key: &str, value: &str, cx: &mut App) {
+    log::info!("setting changed: {key} = {value}");
     state.update(cx, |s, cx| {
         s.storage.set(key, value);
+        if key == keys::FULLSCREEN_FPS_KEY {
+            crate::components::fullscreen_background::set_fps(value);
+        }
         if key == keys::TRANSITION_MODE_KEY || key == keys::CROSSFADE_KEY || key == keys::AUTOMIX_ALBUMS_KEY {
             s.sync_transition(cx);
         }
@@ -236,9 +242,8 @@ fn link_button(id: &str, label: &str, glyph: &str, url: &'static str, cx: &App) 
     secondary_button(id, label, glyph, cx).on_click(move |_, _, cx| cx.open_url(url)).into_any_element()
 }
 
-fn appearance(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyElement {
+fn appearance(state: &Entity<AppState>, tokens: &Tokens, window: &mut Window, cx: &mut App) -> AnyElement {
     const THEMES: &[(&str, &str)] = &[("system", "Match system"), ("dark", "Dark"), ("light", "Light"), ("high-contrast", "High contrast")];
-    const ANIMATED: &[(&str, &str)] = &[("prominent", "Album and player views"), ("everywhere", "Everywhere"), ("off", "Off")];
     let theme_value = cx.global::<theme::ThemeState>().preference.as_str();
     let theme_target = state.clone();
     let theme_select = select(
@@ -252,48 +257,47 @@ fn appearance(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyEle
             {
                 let state = cx.global_mut::<theme::ThemeState>();
                 state.preference = preference;
-                state.tokens = theme::ThemeState::resolve(preference, state.system_light);
+                state.refresh();
             }
             theme::apply(cx);
             cx.refresh_windows();
         }),
         cx,
-    );
+    )
+    .into_any_element();
+    let accent_now = cx.global::<theme::ThemeState>().accent;
+    let picker_state = state.update(cx, |s, cx| s.accent_picker(window, cx));
+    let reset_state = state.clone();
+    let swatches = div()
+        .flex()
+        .items_center()
+        .gap(sz(10.0))
+        .child(div().text_size(sz(11.0)).text_color(tokens.muted).font_features(theme::fonts::tabular_nums()).child(accent_now.to_stored().to_uppercase()))
+        .child(gpui_component::color_picker::ColorPicker::new(&picker_state).anchor(gpui::Anchor::TopRight))
+        .when(!accent_now.is_default(), |d| {
+            d.child(secondary_button("accent-reset", "Reset", "rotate-ccw", cx).on_click(move |_, window, cx| {
+                let default = theme::Accent::DEFAULT;
+                let picker = reset_state.update(cx, |s, cx| {
+                    s.set_accent(default, cx);
+                    s.accent_picker(window, cx)
+                });
+                picker.update(cx, |p, cx| p.set_value(default.swatch(), window, cx));
+            }))
+        })
+        .into_any_element();
     let (floating, separate, scale) = {
         let s = state.read(cx);
         (s.floating_sidebar, s.separate_pins, cx.global::<theme::ThemeState>().scale)
     };
-    let animated_value = {
-        let mode = pref(state, keys::ANIMATED_ARTWORK_MODE_KEY, cx);
-        if mode == "off" || pref(state, keys::ANIMATED_ARTWORK_KEY, cx) == "false" {
-            "off"
-        } else if mode == "everywhere" {
-            "everywhere"
-        } else {
-            "prominent"
-        }
-    };
-    let animated_target = state.clone();
-    let animated = select(
-        state,
-        "animated-artwork",
-        animated_value,
-        ANIMATED,
-        Rc::new(move |mode, _, cx| {
-            set_pref(&animated_target, keys::ANIMATED_ARTWORK_KEY, if mode == "off" { "false" } else { "true" }, cx);
-            set_pref(&animated_target, keys::ANIMATED_ARTWORK_MODE_KEY, mode, cx);
-        }),
-        cx,
-    );
     let (fs, ss, pv) = (state.clone(), state.clone(), state.clone());
-    let experimental = pref(state, "volta-experimental-artwork-loading", cx) == "true";
     let refresh = pref(state, "volta-refresh-collection-on-visit", cx) == "true";
-    let (es, rs) = (state.clone(), state.clone());
+    let rs = state.clone();
     section(
         tokens,
         "Appearance",
         vec![
-            row(tokens, "blue", "palette", "Theme", "Choose the color scheme", theme_select.into_any_element()),
+            row(tokens, "blue", "palette", "Theme", "Choose the color scheme", theme_select),
+            row(tokens, "pink", "palette", "Accent color", "Pick any color. It recolors buttons, toggles, highlights, and icons across Volta.", swatches),
             row(
                 tokens,
                 "indigo",
@@ -337,17 +341,6 @@ fn appearance(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyEle
                         })
                     })
                     .into_any_element(),
-            ),
-            row(tokens, "purple", "sparkles", "Animated artwork", "Choose where animated artwork is allowed to play", animated.into_any_element()),
-            row(
-                tokens,
-                "orange",
-                "flask-conical",
-                "Experimental artwork loading",
-                "Try aggressive artwork preloading",
-                checkbox("experimental-artwork", experimental, tokens, move |v, cx| {
-                    set_pref(&es, "volta-experimental-artwork-loading", if v { "true" } else { "false" }, cx)
-                }),
             ),
             row(
                 tokens,
@@ -524,7 +517,7 @@ fn playback(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyEleme
             }),
         ));
     }
-    let shift_label = if cfg!(target_os = "macos") { "Shift" } else { "Shift" };
+    let shift_label = if cfg!(target_os = "macos") { "Option" } else { "Alt" };
     rows.extend([
         row(
             tokens,
@@ -541,7 +534,7 @@ fn playback(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyEleme
             "green",
             "volume2",
             format!("{shift_label} + scroll step"),
-            format!("Change the volume by this percentage while holding {shift_label}"),
+            format!("Change the volume by this percentage while holding {shift_label} (or Ctrl) and scrolling"),
             stepper("volume-shift-step", format!("{shift_step}%"), tokens, move |d, cx| {
                 set_pref(&s7, keys::VOLUME_SHIFT_SCROLL_STEP_KEY, &(shift_step + d).clamp(1, 10).to_string(), cx)
             }),
@@ -567,11 +560,28 @@ fn playback(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyEleme
 }
 
 fn privacy(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyElement {
-    let external = pref(state, keys::EXTERNAL_LYRICS_KEY, cx) == "true";
+    let external = pref(state, keys::EXTERNAL_LYRICS_KEY, cx) != "false";
     let history = pref(state, keys::LISTENING_HISTORY_ENABLED_KEY, cx) != "false";
     let update_check = pref(state, keys::UPDATE_CHECK_KEY, cx) != "false";
     let checking = state.read(cx).update_checking;
     let (s7, s8) = (state.clone(), state.clone());
+    let channel_value = if pref(state, keys::UPDATE_CHANNEL_KEY, cx) == "nightly" { "nightly" } else { "stable" };
+    let channel_state = state.clone();
+    let channel_select = select(
+        state,
+        "update-channel",
+        channel_value,
+        &[("stable", "Stable"), ("nightly", "Nightly")],
+        Rc::new(move |value, _, cx| {
+            set_pref(&channel_state, keys::UPDATE_CHANNEL_KEY, value, cx);
+            // The banner may belong to the other channel; check again right away.
+            channel_state.update(cx, |s, cx| {
+                s.update = None;
+                s.check_for_updates(true, cx);
+            });
+        }),
+        cx,
+    );
     let (s1, s2, s3, s4, s5, s6) = (state.clone(), state.clone(), state.clone(), state.clone(), state.clone(), state.clone());
     let profile = state.read(cx).profile_summary();
     let storage_summary = state.read(cx).storage_summary();
@@ -599,6 +609,16 @@ fn privacy(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyElemen
             div()
                 .flex()
                 .gap(sz(8.0))
+                .flex_wrap()
+                .justify_end()
+                .child(
+                    secondary_button("open-storage", "Open storage", "folder-open", cx)
+                        .on_click(|_, _, cx| open_folder(volta_services::storage::data_dir(), cx)),
+                )
+                .child(
+                    secondary_button("open-cache", "Open cache", "folder-open", cx)
+                        .on_click(|_, _, cx| open_folder(crate::app_state::artwork_cache_dir(), cx)),
+                )
                 .child(
                     secondary_button("clear-caches", if clearing { "Clearing…" } else { "Clear caches" }, "trash2", cx)
                         .on_click(move |_, _, cx| s5.update(cx, |s, cx| s.clear_caches(cx))),
@@ -630,13 +650,14 @@ fn privacy(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyElemen
                 "refresh-cw",
                 "Check for updates",
                 format!(
-                    "Once a day, ask GitHub for the latest Volta release and tell you if there is one. Nothing is installed automatically. You have {}.",
-                    env!("CARGO_PKG_VERSION")
+                    "Once a day, ask GitHub for the newest Volta on your channel and tell you if there is one. Stable follows tagged releases. Nightly follows the newest successful build of the main branch (the Actions tab on GitHub), which may be rough; open it to download your platform\u{2019}s artifact. Nothing is installed automatically. You have {}.",
+                    crate::build_info::summary()
                 ),
                 div()
                     .flex()
                     .items_center()
                     .gap(sz(10.0))
+                    .child(channel_select)
                     .child(
                         secondary_button("check-updates-now", if checking { "Checking…" } else { "Check now" }, "", cx)
                             .on_click(move |_, _, cx| s8.update(cx, |s, cx| s.check_for_updates(true, cx))),
@@ -701,6 +722,242 @@ fn privacy(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyElemen
     )
 }
 
+/// Opens `path` in Finder, Explorer, or the Linux file manager, creating it first.
+fn open_folder(path: Option<std::path::PathBuf>, cx: &mut App) {
+    let Some(path) = path else { return };
+    let _ = std::fs::create_dir_all(&path);
+    log::info!("opening folder {}", path.display());
+    cx.open_with_system(&path);
+}
+
+/// One label / value line in the About lists.
+fn fact(tokens: &Tokens, label: &str, value: impl Into<SharedString>) -> AnyElement {
+    div()
+        .flex()
+        .items_start()
+        .justify_between()
+        .gap(sz(18.0))
+        .min_h(sz(38.0))
+        .px(sz(14.0))
+        .py(sz(10.0))
+        .text_size(sz(12.0))
+        .child(div().flex_none().text_color(tokens.muted).child(label.to_string()))
+        .child(div().min_w_0().text_right().font_weight(FontWeight::MEDIUM).font_features(theme::fonts::tabular_nums()).child(value.into()))
+        .into_any_element()
+}
+
+/// Settings → About: every version a bug report needs, in one place.
+fn about(state: &Entity<AppState>, tokens: &Tokens, window: &Window, cx: &mut App) -> AnyElement {
+    use crate::build_info as build;
+    let channel = match build::CHANNEL {
+        "stable" => "Stable release",
+        "nightly" => "Nightly build",
+        _ => "Development build",
+    };
+    let update_channel = if pref(state, keys::UPDATE_CHANNEL_KEY, cx) == "nightly" { "Nightly" } else { "Stable" };
+    let scale = cx.global::<theme::ThemeState>().scale;
+    let data_dir = volta_services::storage::data_dir();
+    let logs_dir = crate::logs::root();
+    let show = |p: &Option<std::path::PathBuf>| p.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "not available".into());
+    let display = format!(
+        "{} × {} at {}x, interface scale {}%",
+        f32::from(window.viewport_size().width).round(),
+        f32::from(window.viewport_size().height).round(),
+        window.scale_factor(),
+        scale.round()
+    );
+    let libraries = build::libraries();
+    let renderer = if cfg!(target_os = "macos") {
+        "Metal"
+    } else if cfg!(target_os = "windows") {
+        "DirectX"
+    } else {
+        "Vulkan (wgpu)"
+    };
+
+    let mut report = format!(
+        "{}\nBuilt: {} ({} build)\nTarget: {}\nCompiler: {}\nOS: {}\nHardware: {}\nDisplay: {display}\nRenderer: {renderer}\nSQLite: {} (database layout v{})\nUpdates: {update_channel} channel\n",
+        build::summary(),
+        build::built_label(),
+        build::PROFILE,
+        build::TARGET,
+        build::RUSTC,
+        crate::logs::os_description(),
+        crate::logs::hardware_description(),
+        volta_services::storage::sqlite_version(),
+        volta_services::storage::schema_version(),
+    );
+    for (name, version) in &libraries {
+        report.push_str(&format!("{name} {version}\n"));
+    }
+    let copy_text = report.clone();
+    let check_state = state.clone();
+
+    let top = row(
+        tokens,
+        "pink",
+        "info",
+        format!("Volta {}", build::VERSION),
+        format!("{channel} · commit {} · built {}", build::commit_label(), build::built_label()),
+        div()
+            .flex()
+            .flex_wrap()
+            .justify_end()
+            .gap(sz(8.0))
+            .child(secondary_button("about-copy", "Copy version info", "clipboard-copy", cx).on_click(move |_, _, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_text.clone()));
+            }))
+            .child(
+                secondary_button("about-check", "Check for updates", "refresh-cw", cx)
+                    .on_click(move |_, _, cx| check_state.update(cx, |s, cx| s.check_for_updates(true, cx))),
+            )
+            .into_any_element(),
+    );
+
+    let app = section(
+        tokens,
+        "Volta",
+        vec![
+            top,
+            fact(tokens, "Version", build::VERSION),
+            fact(tokens, "Build", channel),
+            fact(tokens, "Update channel", update_channel),
+            fact(tokens, "Commit", build::commit_label()),
+            fact(tokens, "Built", format!("{} · {} build", build::built_label(), build::PROFILE)),
+            fact(tokens, "Target", build::TARGET),
+            fact(tokens, "Rust compiler", build::RUSTC.trim_start_matches("rustc ")),
+        ],
+        "Include these when you report a problem. Copy version info puts all of this on the clipboard.",
+    );
+    let system = section(
+        tokens,
+        "This device",
+        vec![
+            fact(tokens, "Operating system", crate::logs::os_description()),
+            fact(tokens, "Hardware", crate::logs::hardware_description()),
+            fact(tokens, "Display", display),
+            fact(tokens, "Graphics", renderer),
+            fact(tokens, "Audio engine", format!("symphonia {} · cpal {}", lib(&libraries, "symphonia"), lib(&libraries, "cpal"))),
+        ],
+        "Detected when Volta started. Nothing here is sent anywhere.",
+    );
+    let mut library_rows = vec![
+        fact(tokens, "SQLite", format!("{} (database layout v{})", volta_services::storage::sqlite_version(), volta_services::storage::schema_version())),
+    ];
+    library_rows.extend(libraries.iter().map(|(name, version)| fact(tokens, name, *version)));
+    let libs = section(tokens, "Libraries", library_rows, "The exact versions this build of Volta was compiled against.");
+    let files = section(
+        tokens,
+        "Your data",
+        vec![
+            row(
+                tokens,
+                "teal",
+                "database",
+                "Storage",
+                show(&data_dir),
+                secondary_button("about-open-storage", "Open", "folder-open", cx).on_click({
+                    let dir = data_dir.clone();
+                    move |_, _, cx| open_folder(dir.clone(), cx)
+                }).into_any_element(),
+            ),
+            row(
+                tokens,
+                "orange",
+                "file-text",
+                "Logs",
+                show(&logs_dir),
+                secondary_button("about-open-logs", "Open", "folder-open", cx).on_click({
+                    let dir = logs_dir.clone();
+                    move |_, _, cx| open_folder(dir.clone(), cx)
+                }).into_any_element(),
+            ),
+        ],
+        "Settings, the artwork cache, and log files all live in these folders.",
+    );
+    div().flex().flex_col().gap(sz(27.0)).child(app).child(system).child(libs).child(files).into_any_element()
+}
+
+fn lib<'a>(libraries: &[(&'a str, &'a str)], name: &str) -> &'a str {
+    libraries.iter().find(|(n, _)| *n == name).map(|(_, v)| *v).unwrap_or("?")
+}
+
+/// Settings that trade smoothness for CPU, GPU, and battery.
+fn performance(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyElement {
+    const FPS: &[(&str, &str)] = &[("15", "15 fps"), ("24", "24 fps"), ("30", "30 fps"), ("60", "60 fps"), ("120", "120 fps")];
+    const ANIMATED: &[(&str, &str)] = &[("prominent", "Album and player views"), ("everywhere", "Everywhere"), ("off", "Off")];
+    let bg_limit = pref(state, keys::BACKGROUND_FPS_LIMIT_KEY, cx) == "true";
+    let experimental = pref(state, "volta-experimental-artwork-loading", cx) == "true";
+    let overlay = pref(state, keys::FRAME_MONITOR_KEY, cx) == "true";
+    let (fps_state, es, s1) = (state.clone(), state.clone(), state.clone());
+    let animated_value = {
+        let mode = pref(state, keys::ANIMATED_ARTWORK_MODE_KEY, cx);
+        if mode == "off" || pref(state, keys::ANIMATED_ARTWORK_KEY, cx) == "false" {
+            "off"
+        } else if mode == "everywhere" {
+            "everywhere"
+        } else {
+            "prominent"
+        }
+    };
+    let animated_target = state.clone();
+    let animated = select(
+        state,
+        "animated-artwork",
+        animated_value,
+        ANIMATED,
+        Rc::new(move |mode, _, cx| {
+            set_pref(&animated_target, keys::ANIMATED_ARTWORK_KEY, if mode == "off" { "false" } else { "true" }, cx);
+            set_pref(&animated_target, keys::ANIMATED_ARTWORK_MODE_KEY, mode, cx);
+        }),
+        cx,
+    );
+    let fps_value = as_static(FPS, &pref(state, keys::FULLSCREEN_FPS_KEY, cx), "60");
+    let fps_select = pref_select(state, "fullscreen-fps", keys::FULLSCREEN_FPS_KEY, fps_value, FPS, cx);
+    section(
+        tokens,
+        "Performance",
+        vec![
+            row(tokens, "purple", "sparkles", "Animated artwork", "Choose where animated artwork is allowed to play", animated.into_any_element()),
+            row(
+                tokens,
+                "pink",
+                "gauge",
+                "Full-screen player frame rate",
+                "How often the animated background redraws. Lower uses less power; it is capped by your display",
+                fps_select,
+            ),
+            row(
+                tokens,
+                "orange",
+                "gauge",
+                "Limit frame rate in background",
+                "Cap Volta at about 30 fps while its window isn't focused, saving CPU and GPU. Off by default, so animations stay smooth. Takes effect on the next launch.",
+                checkbox("background-fps-limit", bg_limit, tokens, move |v, cx| set_pref(&fps_state, keys::BACKGROUND_FPS_LIMIT_KEY, if v { "true" } else { "false" }, cx)),
+            ),
+            row(
+                tokens,
+                "orange",
+                "flask-conical",
+                "Experimental artwork loading",
+                "Try aggressive artwork preloading",
+                checkbox("experimental-artwork", experimental, tokens, move |v, cx| {
+                    set_pref(&es, "volta-experimental-artwork-loading", if v { "true" } else { "false" }, cx)
+                }),
+            ),
+            row(
+                tokens,
+                "orange",
+                "gauge",
+                "Performance overlay",
+                "Show rendering, runtime, network, and device diagnostics in the beta player.",
+                checkbox("frame-monitor", overlay, tokens, move |v, cx| set_pref(&s1, keys::FRAME_MONITOR_KEY, if v { "true" } else { "false" }, cx)),
+            ),
+        ],
+        "Options that affect how smoothly Volta draws and how much power it uses.",
+    )
+}
+
 /// Developer options, offered in every build on every OS.
 fn developer(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyElement {
     let console_at_startup = pref(state, keys::CONSOLE_AT_STARTUP_KEY, cx) == "true";
@@ -745,8 +1002,7 @@ fn developer(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyElem
 }
 
 fn diagnostics(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyElement {
-    let overlay = pref(state, keys::FRAME_MONITOR_KEY, cx) == "true";
-    let (s1, s2, s3) = (state.clone(), state.clone(), state.clone());
+    let (s2, s3) = (state.clone(), state.clone());
     let preview = |kind: crate::components::notifications::NoticeKind, label: &'static str, message: &'static str, id: &'static str| {
         let target = s2.clone();
         secondary_button(id, label, "", cx).min_h(sz(30.0)).px(sz(10.0)).py(sz(5.0)).on_click(move |_, _, cx| {
@@ -758,14 +1014,6 @@ fn diagnostics(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyEl
         tokens,
         "Diagnostics",
         vec![
-            row(
-                tokens,
-                "orange",
-                "gauge",
-                "Performance overlay",
-                "Show rendering, runtime, network, and device diagnostics in the beta player.",
-                checkbox("frame-monitor", overlay, tokens, move |v, cx| set_pref(&s1, keys::FRAME_MONITOR_KEY, if v { "true" } else { "false" }, cx)),
-            ),
             row(
                 tokens,
                 "pink",
@@ -1058,14 +1306,26 @@ pub fn render(state: &Entity<AppState>, _content_width: f32, window: &mut Window
             "Help and privacy",
             vec![
                 row(&tokens, "blue", "life-buoy", "Help and troubleshooting", "Connect Navidrome, use local files, and solve common playback issues.", link_button("open-help", "Open help", "", crate::views::connect::HELP_URL, cx)),
+                row(
+                    &tokens,
+                    "orange",
+                    "file-text",
+                    "Log files",
+                    "Volta keeps a detailed log of its last three sessions, including performance figures, on this device only. Attach the latest folder when you report a problem.",
+                    secondary_button("open-logs-help", "Open logs folder", "folder-open", cx)
+                        .on_click(|_, _, cx| open_folder(crate::logs::root(), cx))
+                        .into_any_element(),
+                ),
                 row(&tokens, "gray", "lock", "Privacy notes", "See what stays on this device and what optional services receive.", link_button("open-privacy", "Open privacy", "", crate::views::connect::PRIVACY_URL, cx)),
             ],
             "Find setup guidance, troubleshooting, and Volta’s privacy notes.",
         ),
         "account" => account(state, &tokens, cx),
+        "performance" => performance(state, &tokens, cx),
+        "about" => about(state, &tokens, window, cx),
         "developer" => developer(state, &tokens, cx),
         "diagnostics" if diagnostics_enabled() => diagnostics(state, &tokens, cx),
-        _ => appearance(state, &tokens, cx),
+        _ => appearance(state, &tokens, window, cx),
     };
     div()
         .w_full()

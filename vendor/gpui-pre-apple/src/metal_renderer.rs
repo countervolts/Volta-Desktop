@@ -4,7 +4,7 @@ use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use gpui::{
-    AtlasTextureId, Background, BlurEffectKind, BlurEffectPlan, Bounds, ContentMask, DevicePixels,
+    AtlasTextureId, AtlasTile, Background, BlurEffectKind, BlurEffectPlan, Bounds, ContentMask, DevicePixels,
     PaintSurface, Path, Point, PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -163,7 +163,7 @@ pub struct MetalRenderer {
     effect_textures: Option<VoltaEffectTextures>,
 }
 
-/// Modified for Volta: must match `VoltaEffectParams` in shaders.metal (128 bytes).
+/// Modified for Volta: must match `VoltaEffectParams` in shaders.metal (304 bytes).
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct VoltaEffectParams {
@@ -180,7 +180,8 @@ struct VoltaEffectParams {
     color: [f32; 4],
     offset: [f32; 2],
     opacity: f32,
-    pad: f32,
+    outset: f32,
+    glass: [[f32; 4]; 11],
 }
 
 /// Modified for Volta.
@@ -190,6 +191,9 @@ struct VoltaEffectPipelines {
     blur_h: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     blur_v: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     composite: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    glass: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    cover_scene: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    cover_composite: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
 }
 
 /// Modified for Volta: frame-sized textures the effect passes run in.
@@ -203,8 +207,28 @@ struct VoltaEffectTextures {
 struct VoltaEffectFrame {
     params: InstanceBinding,
     plans: Vec<Option<BlurEffectPlan>>,
+    glass: Vec<bool>,
+    cover: Vec<bool>,
     layer_bindings: Vec<Option<InstanceBindings>>,
     viewport_size: Size<DevicePixels>,
+}
+
+/// Modified for Volta: where the cover background's scene lives in the scratch textures:
+/// the bounds plus a 35 % bleed on every side, at a resolution the Gaussian can cover.
+fn cover_plan(effect: &gpui::BlurEffect, frame_width: u32, frame_height: u32) -> BlurEffectPlan {
+    let sigma = effect.blur_radius.0.max(0.);
+    let mut downsample = 2u32;
+    while sigma / downsample as f32 > 12. && downsample < 32 {
+        downsample *= 2;
+    }
+    let width = (effect.bounds.size.width.0 * 1.7).ceil().max(1.) as u32;
+    let height = (effect.bounds.size.height.0 * 1.7).ceil().max(1.) as u32;
+    BlurEffectPlan {
+        region: [0, 0, frame_width, frame_height],
+        scratch: [width.div_ceil(downsample).min(frame_width), height.div_ceil(downsample).min(frame_height)],
+        downsample,
+        sigma: sigma / downsample as f32,
+    }
 }
 
 fn scissor_rect([x, y, width, height]: [u32; 4]) -> MTLScissorRect {
@@ -472,6 +496,23 @@ impl MetalRenderer {
                     "volta_effect_composite",
                     "volta_effect_composite_vertex",
                     "volta_effect_composite_fragment",
+                    true,
+                )?,
+                cover_scene: pass("volta_cover_scene", "volta_cover_scene_fragment")?,
+                cover_composite: build_effect_pipeline_state(
+                    &device,
+                    &library,
+                    "volta_cover_composite",
+                    "volta_effect_composite_vertex",
+                    "volta_cover_composite_fragment",
+                    true,
+                )?,
+                glass: build_effect_pipeline_state(
+                    &device,
+                    &library,
+                    "volta_effect_glass",
+                    "volta_effect_glass_vertex",
+                    "volta_effect_glass_fragment",
                     true,
                 )?,
             })
@@ -1114,9 +1155,18 @@ impl MetalRenderer {
         let mut layer_bindings: Vec<Option<InstanceBindings>> = Vec::new();
         layer_bindings.resize_with(scene.filter_layers.len(), || None);
         for effect in &scene.effects {
-            let is_layer = !matches!(effect.kind, BlurEffectKind::BackdropBlur | BlurEffectKind::Glass); // Modified for Volta: glass is only drawn by the wgpu renderer; here it degrades to a backdrop blur.
-            let plan = gpui::plan_blur_effect(effect, width, height)
-                .filter(|_| !is_layer || effect.layer < scene.filter_layers.len());
+            let is_glass = effect.kind == BlurEffectKind::Glass;
+            let is_layer = !matches!(
+                effect.kind,
+                BlurEffectKind::BackdropBlur | BlurEffectKind::Glass | BlurEffectKind::CoverBackground
+            );
+            let is_cover = effect.kind == BlurEffectKind::CoverBackground;
+            let plan = if is_cover {
+                Some(cover_plan(effect, width, height))
+            } else {
+                gpui::plan_blur_effect(effect, width, height)
+                    .filter(|_| !is_layer || effect.layer < scene.filter_layers.len())
+            };
             if plan.is_some() && is_layer && layer_bindings[effect.layer].is_none() {
                 let layer = &scene.filter_layers[effect.layer].scene;
                 layer_bindings[effect.layer] = Some(write_instances(layer, writer)?);
@@ -1131,16 +1181,52 @@ impl MetalRenderer {
             let color = gpui::Rgba::from(effect.color);
             let radii = effect.corner_radii;
             let bounds = |b: Bounds<ScaledPixels>| [b.origin.x.0, b.origin.y.0, b.size.width.0, b.size.height.0];
+            let mut glass = [
+                effect.glass.tint,
+                effect.glass.optics,
+                effect.glass.blur,
+                effect.glass.tone,
+                effect.glass.light,
+                effect.glass.rim,
+                effect.glass.shadow,
+                effect.glass.state,
+                effect.glass.pointer,
+                effect.glass.edge,
+                effect.glass.finish,
+            ];
+            let mut region = plan.region.map(|v| v as f32);
+            if let Some(cover) = effect.cover.filter(|_| is_cover) {
+                // The scene's virtual origin bleeds 35 % past the bounds on every side.
+                let b = effect.bounds;
+                region = [
+                    b.origin.x.0 - 0.35 * b.size.width.0,
+                    b.origin.y.0 - 0.35 * b.size.height.0,
+                    1.7 * b.size.width.0,
+                    1.7 * b.size.height.0,
+                ];
+                let rect = |tile: Option<AtlasTile>| {
+                    tile.map_or([0.; 4], |t| {
+                        [t.bounds.origin.x.0 as f32, t.bounds.origin.y.0 as f32, t.bounds.size.width.0 as f32, t.bounds.size.height.0 as f32]
+                    })
+                };
+                glass = [[0.; 4]; 11];
+                glass[0] = [cover.seconds, cover.fade, 0., 0.];
+                glass[1] = [cover.canvas[0], cover.canvas[1], cover.canvas[2], 0.];
+                glass[2] = rect(cover.cover);
+                glass[3] = rect(cover.previous);
+            }
             params.push(VoltaEffectParams {
-                region: plan.region.map(|v| v as f32),
+                region,
                 scratch_size: plan.scratch.map(|v| v as f32),
                 texture_size: [width as f32, height as f32],
                 downsample: plan.downsample as f32,
                 sigma: plan.sigma,
                 kind: match effect.kind {
-                    BlurEffectKind::BackdropBlur | BlurEffectKind::Glass => 0,
+                    BlurEffectKind::BackdropBlur => 0,
                     BlurEffectKind::LayerBlur => 1,
                     BlurEffectKind::LayerShadow => 2,
+                    BlurEffectKind::Glass => 3,
+                    BlurEffectKind::CoverBackground => 4,
                 },
                 saturation: effect.saturation,
                 bounds: bounds(effect.bounds),
@@ -1149,12 +1235,15 @@ impl MetalRenderer {
                 color: [color.r * color.a, color.g * color.a, color.b * color.a, color.a],
                 offset: [effect.offset.x.0, effect.offset.y.0],
                 opacity: effect.opacity,
-                pad: 0.,
+                outset: if is_glass { effect.glass.outset().ceil() } else { 0. },
+                glass,
             });
         }
         Ok(Some(VoltaEffectFrame {
             params: writer.write(&params)?,
             plans,
+            glass: scene.effects.iter().map(|e| e.kind == BlurEffectKind::Glass).collect(),
+            cover: scene.effects.iter().map(|e| e.kind == BlurEffectKind::CoverBackground).collect(),
             layer_bindings,
             viewport_size,
         }))
@@ -1213,6 +1302,9 @@ impl MetalRenderer {
         };
         let effect = &scene.effects[effect_ix];
         let [x, y, width, height] = plan.region;
+        if effect.kind == BlurEffectKind::CoverBackground {
+            return self.encode_cover(command_buffer, effect, effect_ix, plan, frame);
+        }
         match effect.kind {
             BlurEffectKind::BackdropBlur | BlurEffectKind::Glass => {
                 let blit = command_buffer
@@ -1244,6 +1336,7 @@ impl MetalRenderer {
                 }
                 blit.endEncoding();
             }
+            BlurEffectKind::CoverBackground => unreachable!("handled above"),
             BlurEffectKind::LayerBlur | BlurEffectKind::LayerShadow => {
                 let Some(layer_bindings) = frame.layer_bindings.get(effect.layer).and_then(Option::as_ref)
                 else {
@@ -1315,6 +1408,72 @@ impl MetalRenderer {
         Ok(())
     }
 
+    /// Modified for Volta: the cover background's passes. The scene is evaluated straight
+    /// into scratch texture `a` at the downsampled resolution, then blurred in place.
+    fn encode_cover(
+        &self,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+        effect: &gpui::BlurEffect,
+        effect_ix: usize,
+        plan: BlurEffectPlan,
+        frame: &VoltaEffectFrame,
+    ) -> Result<()> {
+        let (Some(pipelines), Some(textures)) = (&self.effect_pipelines, &self.effect_textures) else {
+            return Ok(());
+        };
+        let Some(cover) = effect.cover else {
+            return Ok(());
+        };
+        let atlas_texture = |tile: Option<AtlasTile>| tile.and_then(|t| self.sprite_atlas.metal_texture(t.texture_id));
+        let current = atlas_texture(cover.cover);
+        let previous = atlas_texture(cover.previous);
+        // A missing cover binds the other one; its rect has zero width so it is never read.
+        let (Some(first), Some(second)) = (current.clone().or_else(|| previous.clone()), previous.or(current)) else {
+            return Ok(());
+        };
+
+        let [scratch_width, scratch_height] = plan.scratch;
+        let scratch_size: Size<DevicePixels> = size((scratch_width as i32).into(), (scratch_height as i32).into());
+        let scene = new_command_encoder_for_texture(command_buffer, &textures.a, scratch_size, None)?;
+        scene.setScissorRect(scissor_rect([0, 0, scratch_width, scratch_height]));
+        scene.setRenderPipelineState(&pipelines.cover_scene);
+        // SAFETY: As in `encode_effect`; the atlas textures are retained by the encoder.
+        unsafe {
+            scene.setFragmentBuffer_offset_atIndex(Some(&frame.params.buffer), frame.params.offset, 0);
+            scene.setFragmentTexture_atIndex(Some(&first), 0);
+            scene.setFragmentTexture_atIndex(Some(&second), 1);
+            scene.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
+                MTLPrimitiveType::Triangle,
+                0,
+                3,
+                1,
+                effect_ix,
+            );
+        }
+        scene.endEncoding();
+
+        let passes = [(&pipelines.blur_h, &textures.a, &textures.b), (&pipelines.blur_v, &textures.b, &textures.a)];
+        for (pipeline, source, target) in passes {
+            let encoder = new_command_encoder_for_texture(command_buffer, target, scratch_size, None)?;
+            encoder.setScissorRect(scissor_rect([0, 0, scratch_width, scratch_height]));
+            encoder.setRenderPipelineState(pipeline);
+            // SAFETY: As in `encode_effect`.
+            unsafe {
+                encoder.setFragmentBuffer_offset_atIndex(Some(&frame.params.buffer), frame.params.offset, 0);
+                encoder.setFragmentTexture_atIndex(Some(source), 0);
+                encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
+                    MTLPrimitiveType::Triangle,
+                    0,
+                    3,
+                    1,
+                    effect_ix,
+                );
+            }
+            encoder.endEncoding();
+        }
+        Ok(())
+    }
+
     /// Modified for Volta: draws scratch texture `a` (the blurred effect) into the
     /// frame at the effect's bounds.
     fn draw_effect_composite(
@@ -1328,7 +1487,15 @@ impl MetalRenderer {
             return;
         };
         let viewport = [viewport_size.width.0 as f32, viewport_size.height.0 as f32];
-        command_encoder.setRenderPipelineState(&pipelines.composite);
+        let is_glass = frame.glass.get(effect_ix).copied().unwrap_or(false);
+        let is_cover = frame.cover.get(effect_ix).copied().unwrap_or(false);
+        command_encoder.setRenderPipelineState(if is_glass {
+            &pipelines.glass
+        } else if is_cover {
+            &pipelines.cover_composite
+        } else {
+            &pipelines.composite
+        });
         // SAFETY: As in `encode_effect`; the viewport bytes are copied from a live value.
         unsafe {
             command_encoder.setVertexBuffer_offset_atIndex(Some(&frame.params.buffer), frame.params.offset, 0);
@@ -1338,7 +1505,13 @@ impl MetalRenderer {
                 1,
             );
             command_encoder.setFragmentBuffer_offset_atIndex(Some(&frame.params.buffer), frame.params.offset, 0);
-            command_encoder.setFragmentTexture_atIndex(Some(&textures.a), 0);
+            if is_glass {
+                // Slot 0: the sharp backdrop copy; slot 1: the blurred one.
+                command_encoder.setFragmentTexture_atIndex(Some(&textures.source), 0);
+                command_encoder.setFragmentTexture_atIndex(Some(&textures.a), 1);
+            } else {
+                command_encoder.setFragmentTexture_atIndex(Some(&textures.a), 0);
+            }
             command_encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
                 MTLPrimitiveType::TriangleStrip,
                 0,

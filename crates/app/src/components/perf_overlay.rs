@@ -155,7 +155,7 @@ fn estimate_interval(samples: &[f32]) -> Option<(f32, f32)> {
 
 /// Resident memory of this process, on every desktop OS.
 #[cfg(target_os = "linux")]
-fn resident_memory() -> Option<u64> {
+pub(crate) fn resident_memory() -> Option<u64> {
     let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
     let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
     // SAFETY: `sysconf` has no preconditions.
@@ -164,7 +164,7 @@ fn resident_memory() -> Option<u64> {
 }
 
 #[cfg(target_os = "windows")]
-fn resident_memory() -> Option<u64> {
+pub(crate) fn resident_memory() -> Option<u64> {
     #[repr(C)]
     struct ProcessMemoryCounters {
         cb: u32,
@@ -192,7 +192,7 @@ fn resident_memory() -> Option<u64> {
 }
 
 #[cfg(target_os = "macos")]
-fn resident_memory() -> Option<u64> {
+pub(crate) fn resident_memory() -> Option<u64> {
     /// `mach_task_basic_info`.
     #[repr(C)]
     struct TaskBasicInfo {
@@ -218,7 +218,7 @@ fn resident_memory() -> Option<u64> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-fn resident_memory() -> Option<u64> {
+pub(crate) fn resident_memory() -> Option<u64> {
     None
 }
 

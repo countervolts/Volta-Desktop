@@ -214,14 +214,140 @@ impl Tokens {
     pub fn is_light(&self) -> bool {
         self.appearance == Appearance::Light
     }
+
+    /// Swaps the red accent (and the selection tint built from it) for `accent`.
+    pub fn with_accent(mut self, accent: Accent) -> Self {
+        let color = match self.appearance {
+            Appearance::Dark => accent.on_dark(),
+            Appearance::Light => accent.on_light(),
+            Appearance::HighContrast => accent.on_contrast(),
+        };
+        // The stock selection tints are the accent at ~13%/20%/24% alpha.
+        let alpha = match self.appearance {
+            Appearance::Dark => 0x21 as f32 / 255.0,
+            Appearance::Light => 0x13 as f32 / 255.0,
+            Appearance::HighContrast => 0x3d as f32 / 255.0,
+        };
+        self.accent = color;
+        self.selection = Hsla { a: alpha, ..color };
+        self
+    }
 }
 
-/// `.primary-button` fills are fixed, not themed.
+/// The app's accent colour: any colour the user picks. The default red keeps
+/// its hand-tuned shades; every other colour derives its shades from the pick,
+/// with lightness clamped so text stays readable on each surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Accent(u32);
+
+impl Default for Accent {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl Accent {
+    /// `#e73650`, the original button red.
+    pub const DEFAULT: Accent = Accent(0xe73650);
+
+    pub fn is_default(self) -> bool {
+        self == Self::DEFAULT
+    }
+
+    /// `#rrggbb`; anything else (empty, garbage) is the default.
+    pub fn from_stored(value: &str) -> Self {
+        let digits = value.trim().trim_start_matches('#');
+        if digits.len() == 6 {
+            if let Ok(rgb) = u32::from_str_radix(digits, 16) {
+                return Accent(rgb);
+            }
+        }
+        Self::DEFAULT
+    }
+
+    pub fn to_stored(self) -> String {
+        format!("#{:06x}", self.0)
+    }
+
+    /// The picked colour; the picker's alpha is ignored.
+    pub fn from_hsla(color: Hsla) -> Self {
+        let c = Rgba::from(color);
+        let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+        Accent(byte(c.r) << 16 | byte(c.g) << 8 | byte(c.b))
+    }
+
+    /// Exactly what the user picked.
+    pub fn swatch(self) -> Hsla {
+        hex(&self.to_stored())
+    }
+
+    /// The pick with its lightness moved by `shift` and kept within `[min, max]`.
+    fn tuned(self, shift: f32, min: f32, max: f32) -> Hsla {
+        let mut c = self.swatch();
+        c.l = (c.l + shift).clamp(min, max);
+        c
+    }
+
+    /// Text and icon accent on the dark theme (`#fa586a` for red).
+    fn on_dark(self) -> Hsla {
+        if self.is_default() { hex("#fa586a") } else { self.tuned(0.10, 0.60, 0.80) }
+    }
+    /// `#e52443` for red.
+    fn on_light(self) -> Hsla {
+        if self.is_default() { hex("#e52443") } else { self.tuned(-0.02, 0.22, 0.48) }
+    }
+    /// `#ff6475` for red.
+    fn on_contrast(self) -> Hsla {
+        if self.is_default() { hex("#ff6475") } else { self.tuned(0.14, 0.68, 0.88) }
+    }
+    /// Primary button fill, which carries white text (`#e73650` for red).
+    fn primary(self) -> Hsla {
+        if self.is_default() { self.swatch() } else { self.tuned(0.0, 0.30, 0.52) }
+    }
+    /// `#fa4059` for red.
+    fn primary_hover(self) -> Hsla {
+        if self.is_default() { hex("#fa4059") } else { self.tuned(0.0, 0.30, 0.52).lighten(0.07) }
+    }
+}
+
+trait Lighten {
+    fn lighten(self, by: f32) -> Self;
+}
+
+impl Lighten for Hsla {
+    fn lighten(mut self, by: f32) -> Self {
+        self.l = (self.l + by).min(1.0);
+        self
+    }
+}
+
+/// Colours that views read without a `cx` (buttons built in free functions).
+/// Refreshed by [`apply`].
+struct Palette {
+    primary: Hsla,
+    primary_hover: Hsla,
+    accent_dark: Hsla,
+}
+
+static PALETTE: parking_lot::RwLock<Option<Palette>> = parking_lot::RwLock::new(None);
+
+fn palette<R>(read: impl FnOnce(&Palette) -> R) -> R {
+    if let Some(p) = PALETTE.read().as_ref() {
+        return read(p);
+    }
+    read(&Palette { primary: hex("#e73650"), primary_hover: hex("#fa4059"), accent_dark: hex("#fa586a") })
+}
+
+/// `.primary-button` fill: follows the accent.
 pub fn primary_fill() -> Hsla {
-    hex("#e73650")
+    palette(|p| p.primary)
 }
 pub fn primary_fill_hover() -> Hsla {
-    hex("#fa4059")
+    palette(|p| p.primary_hover)
+}
+/// The accent as it looks on a dark surface (full-screen player, charts).
+pub fn accent_on_dark() -> Hsla {
+    palette(|p| p.accent_dark)
 }
 
 /// Global theme state: the user's preference, what the OS reports, and scale.
@@ -232,19 +358,26 @@ pub struct ThemeState {
     pub scale: f32,
     pub tokens: Tokens,
     pub font_family: gpui::SharedString,
+    pub accent: Accent,
 }
 
 impl Global for ThemeState {}
 
 impl ThemeState {
-    pub fn resolve(preference: ThemePreference, system_light: bool) -> Tokens {
-        match preference {
+    pub fn resolve(preference: ThemePreference, system_light: bool, accent: Accent) -> Tokens {
+        let base = match preference {
             ThemePreference::Dark => Tokens::dark(),
             ThemePreference::Light => Tokens::light(),
             ThemePreference::HighContrast => Tokens::high_contrast(),
             ThemePreference::System if system_light => Tokens::light(),
             ThemePreference::System => Tokens::dark(),
-        }
+        };
+        base.with_accent(accent)
+    }
+
+    /// Recomputes `tokens` after the preference, OS appearance or accent changed.
+    pub fn refresh(&mut self) {
+        self.tokens = Self::resolve(self.preference, self.system_light, self.accent);
     }
 }
 
@@ -281,10 +414,11 @@ pub fn fullscreen_tokens(base: &Tokens) -> Tokens {
 pub const NORMAL_LINE_HEIGHT: f32 = 1.15;
 
 pub fn apply(cx: &mut App) {
-    let (tokens, scale, family) = {
+    let (tokens, scale, family, accent) = {
         let state = cx.global::<ThemeState>();
-        (state.tokens.clone(), state.scale, state.font_family.clone())
+        (state.tokens.clone(), state.scale, state.font_family.clone(), state.accent)
     };
+    *PALETTE.write() = Some(Palette { primary: accent.primary(), primary_hover: accent.primary_hover(), accent_dark: accent.on_dark() });
     let mode = if tokens.is_light() {
         gpui_component::ThemeMode::Light
     } else {

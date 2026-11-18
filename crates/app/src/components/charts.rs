@@ -11,6 +11,63 @@ use gpui::{
 
 use crate::theme::{self, Tokens, sz};
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+/// How long a chart takes to draw itself in.
+const ENTRANCE_MS: f32 = 850.0;
+
+thread_local! {
+    /// Per chart id: the data signature it last drew and when that drawing began.
+    static ENTRANCES: RefCell<HashMap<String, (u64, Instant)>> = RefCell::new(HashMap::new());
+}
+
+/// Bumped whenever the stats page is opened, so its charts draw in again.
+static VISIT: AtomicU64 = AtomicU64::new(0);
+
+pub fn replay_entrances() {
+    VISIT.fetch_add(1, Ordering::Relaxed);
+}
+
+fn signature(values: &[f64]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    VISIT.load(Ordering::Relaxed).hash(&mut hasher);
+    for v in values {
+        v.to_bits().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// 0 → 1 over [`ENTRANCE_MS`], restarting when the chart's data changes or the
+/// page is reopened. Asks for frames while moving; settled at 1 when the user
+/// prefers reduced motion.
+fn entrance(id: &str, values: &[f64], window: &gpui::Window, cx: &gpui::App) -> f32 {
+    if cx.reduce_motion() {
+        return 1.0;
+    }
+    let sig = signature(values);
+    let t = ENTRANCES.with(|map| {
+        let mut map = map.borrow_mut();
+        let entry = map.entry(id.to_string()).or_insert_with(|| (sig, Instant::now()));
+        if entry.0 != sig {
+            *entry = (sig, Instant::now());
+        }
+        entry.1.elapsed().as_secs_f32() * 1000.0 / ENTRANCE_MS
+    });
+    if t < 1.0 {
+        window.request_animation_frame();
+    }
+    t.min(1.0)
+}
+
+/// Fast start, gentle landing.
+fn ease_out(t: f32) -> f32 {
+    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+}
+
 /// Recharts-like integer ticks from 0: 5 ticks with a 1/2/5 × 10ⁿ step.
 pub fn nice_ticks(max: f64) -> Vec<f64> {
     let rough = (max / 4.0).max(0.0);
@@ -86,7 +143,7 @@ fn frame(
     width: f32,
     height: f32,
     tokens: &Tokens,
-    paint: impl Fn(Bounds<Pixels>, f64, &mut gpui::Window) + 'static,
+    paint: impl Fn(Bounds<Pixels>, f64, &mut gpui::Window, &gpui::App) + 'static,
 ) -> AnyElement {
     let plot_w = (width - AXIS_WIDTH - 6.0).max(1.0);
     let plot_h = (height - AXIS_HEIGHT - 8.0).max(1.0);
@@ -108,7 +165,7 @@ fn frame(
     root.child(
         canvas(
             |_, _, _| (),
-            move |bounds, _, window, _| {
+            move |bounds, _, window, cx| {
                 let s = scale(window);
                 let plot = Bounds {
                     origin: point(bounds.origin.x + px(AXIS_WIDTH * s), bounds.origin.y + px(8.0 * s)),
@@ -132,7 +189,7 @@ fn frame(
                 if let Ok(path) = axes.build() {
                     window.paint_path(path, axis);
                 }
-                paint(plot, top, window);
+                paint(plot, top, window, cx);
             },
         )
         .absolute()
@@ -142,16 +199,18 @@ fn frame(
 }
 
 /// "Plays by …": monotone area with an accent gradient (0.48 → 0) and a 2px line.
-pub fn area_chart(labels: Vec<String>, values: Vec<f64>, width: f32, height: f32, tokens: &Tokens) -> AnyElement {
+pub fn area_chart(id: &'static str, labels: Vec<String>, values: Vec<f64>, width: f32, height: f32, tokens: &Tokens) -> AnyElement {
     let ticks = nice_ticks(values.iter().cloned().fold(0.0, f64::max));
     let accent = tokens.accent;
-    frame(labels, ticks, width, height, tokens, move |plot, top, window| {
+    frame(labels, ticks, width, height, tokens, move |plot, top, window, cx| {
         let n = values.len();
         if n == 0 {
             return;
         }
+        // The line and its fill rise from the baseline together.
+        let rise = ease_out(entrance(id, &values, window, cx));
         let x = |i: usize| plot.origin.x + plot.size.width * ((i as f32 + 0.5) / n as f32);
-        let y = |v: f64| plot.origin.y + plot.size.height * (1.0 - (v / top.max(1e-9)) as f32);
+        let y = |v: f64| plot.origin.y + plot.size.height * (1.0 - (v / top.max(1e-9)) as f32 * rise);
         let points: Vec<Point<Pixels>> = values.iter().enumerate().map(|(i, v)| point(x(i), y(*v))).collect();
         let segments = monotone(&points);
         let bottom = plot.origin.y + plot.size.height;
@@ -178,11 +237,14 @@ pub fn area_chart(labels: Vec<String>, values: Vec<f64>, width: f32, height: f32
 }
 
 /// "Listening time": bars at most 32px wide with 3px top corners.
-pub fn bar_chart(labels: Vec<String>, values: Vec<f64>, width: f32, height: f32, tokens: &Tokens) -> AnyElement {
+pub fn bar_chart(id: &'static str, labels: Vec<String>, values: Vec<f64>, width: f32, height: f32, tokens: &Tokens) -> AnyElement {
     let ticks = nice_ticks(values.iter().cloned().fold(0.0, f64::max));
     let accent = tokens.accent;
-    frame(labels, ticks, width, height, tokens, move |plot, top, window| {
+    frame(labels, ticks, width, height, tokens, move |plot, top, window, cx| {
         let n = values.len().max(1);
+        let progress = entrance(id, &values, window, cx);
+        // Bars grow left to right: each starts a little after the one before it.
+        const STAGGER: f32 = 0.45;
         let band = plot.size.width / n as f32;
         // recharts: bar size is 90 % of the band (10 % gap), capped at 32px.
         let s = f32::from(window.rem_size()) / 16.0;
@@ -191,7 +253,11 @@ pub fn bar_chart(labels: Vec<String>, values: Vec<f64>, width: f32, height: f32,
             if *value <= 0.0 {
                 continue;
             }
-            let h = plot.size.height * (*value / top.max(1e-9)) as f32;
+            let local = ((progress - STAGGER * i as f32 / n as f32) / (1.0 - STAGGER)).clamp(0.0, 1.0);
+            let h = plot.size.height * (*value / top.max(1e-9)) as f32 * ease_out(local);
+            if h < px(0.5) {
+                continue;
+            }
             let left = plot.origin.x + band * i as f32 + (band - bar) / 2.0;
             let bottom = plot.origin.y + plot.size.height;
             let r = px(3.0 * s).min(h).min(bar / 2.0);
@@ -211,19 +277,22 @@ pub fn bar_chart(labels: Vec<String>, values: Vec<f64>, width: f32, height: f32,
 }
 
 /// "Genre breakdown": donut, inner 54 %, outer 78 %, 2° padding.
-pub fn donut(values: Vec<f64>, colors: Vec<Hsla>, size: f32) -> AnyElement {
+pub fn donut(id: String, values: Vec<f64>, colors: Vec<Hsla>, size: f32) -> AnyElement {
     canvas(
         |_, _, _| (),
-        move |bounds, _, window, _| {
+        move |bounds, _, window, cx| {
             let total: f64 = values.iter().sum();
             if total <= 0.0 {
                 return;
             }
+            // The ring sweeps round to its full size.
+            let sweep_in = ease_out(entrance(&id, &values, window, cx));
             let center = bounds.center();
             let radius = f32::from(bounds.size.width.min(bounds.size.height)) / 2.0;
             let (outer, inner) = (radius * 0.78, radius * 0.54);
-            let padding = if values.len() > 1 { 2f32.to_radians() } else { 0.0 };
-            let available = std::f32::consts::TAU - padding * values.len() as f32;
+            let base_padding = if values.len() > 1 { 2f32.to_radians() } else { 0.0 };
+            let padding = base_padding * sweep_in;
+            let available = (std::f32::consts::TAU - base_padding * values.len() as f32) * sweep_in;
             // recharts starts at 0° (3 o'clock) and runs counter-clockwise.
             let mut angle = 0.0f32;
             for (i, value) in values.iter().enumerate() {
@@ -253,7 +322,9 @@ pub fn donut(values: Vec<f64>, colors: Vec<Hsla>, size: f32) -> AnyElement {
 
 /// `GRAPH_COLORS`.
 pub fn graph_colors() -> Vec<Hsla> {
-    ["#fa586a", "#d9899d", "#b79bdf", "#79b6c9", "#d7b36d", "#86b987", "#dd8d66", "#8ea8d8"].iter().map(|c| theme::hex(c)).collect()
+    let mut colors = vec![theme::accent_on_dark()];
+    colors.extend(["#d9899d", "#b79bdf", "#79b6c9", "#d7b36d", "#86b987", "#dd8d66", "#8ea8d8"].iter().map(|c| theme::hex(c)));
+    colors
 }
 
 #[cfg(test)]

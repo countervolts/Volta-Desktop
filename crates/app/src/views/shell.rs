@@ -171,6 +171,7 @@ impl Shell {
         // Client-side window frame (Linux): the bar's empty space moves the
         // window and the window controls end it.
         let client_frame = window_chrome::client_side(window);
+        let drag_region = window_chrome::custom_titlebar(window);
         div()
             .h(sz(53.0))
             .flex_none()
@@ -214,7 +215,7 @@ impl Shell {
                             .child(title),
                     )),
             )
-            .when(client_frame, |d| d.child(window_chrome::drag_area(div().id("toolbar-drag")).flex_1().h_full()))
+            .when(drag_region, |d| d.child(window_chrome::drag_area(div().id("toolbar-drag")).flex_1().h_full()))
             // `.search-toolbar`: a centered search field and the scope chip.
             .when(search_page, |bar| {
                 let refresh = self.state.clone();
@@ -334,6 +335,8 @@ impl Shell {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _build_time = crate::logs::RenderTimer::start();
+        crate::logs::mark("first frame");
         window_chrome::record_corners(window, cx);
         #[cfg(feature = "shots")]
         if let Some(y) = std::env::var("VOLTA_SHOT_SCROLL").ok().and_then(|v| v.parse::<f32>().ok()) {
@@ -595,9 +598,8 @@ impl Render for Shell {
                 })
             })
             .children({
-                // `betaChannel && frameMonitor`: diagnostics builds only.
-                let on = crate::views::settings::diagnostics_enabled()
-                    && self.state.read(cx).storage.get(volta_logic::storage::FRAME_MONITOR_KEY) == "true";
+                // The toggle lives in Settings → Performance, in every build.
+                let on = self.state.read(cx).storage.get(volta_logic::storage::FRAME_MONITOR_KEY) == "true";
                 if !on {
                     self.perf = None;
                 }

@@ -98,7 +98,7 @@ pub fn render(state: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
             .cursor_pointer()
             .map(|d| {
                 if primary {
-                    d.bg(theme::hex("#e73650")).text_color(gpui::white()).hover(|s| s.bg(theme::hex("#fa4059")))
+                    d.bg(theme::primary_fill()).text_color(gpui::white()).hover(|s| s.bg(theme::primary_fill_hover()))
                 } else {
                     d.bg(tokens.surface).text_color(tokens.accent).hover(|s| s.bg(tokens.hover))
                 }

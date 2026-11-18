@@ -42,8 +42,14 @@ souvlaki = { version = "0.9.3", default-features = false, features = ["use_zbus"
 # window class loads it); a no-op for other targets.
 winresource = "0.1"
 
-[target.'cfg(target_os = "linux")'.dependencies]
+# Without font-kit gpui_macos renders no text at all.
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui_platform = { workspace = true, features = ["font-kit"] }
+
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
 gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.12", optional = true }
 
 [features]

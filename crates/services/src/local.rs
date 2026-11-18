@@ -87,6 +87,9 @@ pub struct Scan {
 /// Walks `root`, reads tags (reusing `cache`), extracts folder covers into
 /// `artwork_dir`, applies `overrides`, and builds the library.
 pub fn scan_directory(root: &Path, cache: &MetadataCache, overrides: &HashMap<String, MetadataPatch>, artwork_dir: &Path) -> Scan {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let started = std::time::Instant::now();
+    let (cached, parsed) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let mut audio: Vec<(PathBuf, String, u64, f64)> = Vec::new();
     let mut images: Vec<ScannedImage> = Vec::new();
     for entry in walkdir::WalkDir::new(root).follow_links(true).into_iter().filter_map(Result::ok) {
@@ -102,10 +105,17 @@ pub fn scan_directory(root: &Path, cache: &MetadataCache, overrides: &HashMap<St
             images.push(ScannedImage { path: rel, file: path.to_string_lossy().into_owned() });
         }
     }
+    let walked = started.elapsed();
     let tracks: Vec<ScannedTrack> = pool(&audio, |(path, rel, size, modified)| {
         let mut metadata = match cache.get(rel) {
-            Some(hit) if hit.size == *size as f64 && hit.last_modified == *modified => hit.metadata.clone(),
-            _ => read_tags(path, *size, false),
+            Some(hit) if hit.size == *size as f64 && hit.last_modified == *modified => {
+                cached.fetch_add(1, Relaxed);
+                hit.metadata.clone()
+            }
+            _ => {
+                parsed.fetch_add(1, Relaxed);
+                read_tags(path, *size, false)
+            }
         };
         // Cached entries from before durations were stored get one now.
         if metadata.duration.is_none() {
@@ -117,6 +127,7 @@ pub fn scan_directory(root: &Path, cache: &MetadataCache, overrides: &HashMap<St
     .flatten()
     .collect();
 
+    let tagged = started.elapsed();
     // Embedded covers: one representative track per folder without an image.
     let _ = std::fs::create_dir_all(artwork_dir);
     let representatives = artwork_representatives(&tracks, &images);
@@ -146,7 +157,24 @@ pub fn scan_directory(root: &Path, cache: &MetadataCache, overrides: &HashMap<St
         .map(|t| (t.path.clone(), CachedMetadata { size: t.size, last_modified: t.modified, metadata: t.metadata.clone() }))
         .collect();
     let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Music".into());
+    let artworked = started.elapsed();
+    let (audio_files, image_files, folders_with_art) = (audio.len(), images.len(), embedded.len());
     let library = build_library(&name, &root.to_string_lossy(), tracks, &images, &embedded, overrides);
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    log::info!(
+        target: "perf",
+        "local scan: {audio_files} audio files, {image_files} images -> {} tracks, {} albums, {} artists | walk {:.0} ms, tags {:.0} ms ({} from cache, {} read), artwork {:.0} ms ({folders_with_art} folders), build {:.0} ms | total {:.0} ms",
+        library.tracks.len(),
+        library.albums.len(),
+        library.artists.len(),
+        ms(walked),
+        ms(tagged - walked),
+        cached.load(Relaxed),
+        parsed.load(Relaxed),
+        ms(artworked - tagged),
+        ms(started.elapsed() - artworked),
+        ms(started.elapsed()),
+    );
     Scan { library, cache }
 }
 

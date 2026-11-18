@@ -609,7 +609,7 @@ impl DirectXRenderer {
 
         for effect_ix in range {
             let effect = &scene.effects[effect_ix];
-            let is_layer = !matches!(effect.kind, BlurEffectKind::BackdropBlur | BlurEffectKind::Glass);
+            let is_layer = !matches!(effect.kind, BlurEffectKind::BackdropBlur | BlurEffectKind::Glass | BlurEffectKind::CoverBackground);
             let is_glass = effect.kind == BlurEffectKind::Glass;
             if is_layer && effect.layer >= scene.filter_layers.len() {
                 continue;
@@ -628,7 +628,8 @@ impl DirectXRenderer {
                 downsample: plan.downsample as f32,
                 sigma: plan.sigma,
                 kind: match effect.kind {
-                    BlurEffectKind::BackdropBlur => 0,
+                    // CoverBackground is Metal-only: it would draw as a backdrop blur.
+                    BlurEffectKind::BackdropBlur | BlurEffectKind::CoverBackground => 0,
                     BlurEffectKind::LayerBlur => 1,
                     BlurEffectKind::LayerShadow => 2,
                     BlurEffectKind::Glass => 3,

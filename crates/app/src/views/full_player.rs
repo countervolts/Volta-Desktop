@@ -154,7 +154,7 @@ impl Render for FullPlayer {
             .child({
                 let p = p.clone();
                 button("fs-shuffle", "Shuffle".into(), icon("shuffle", 16.0).into_any_element())
-                    .color(if shuffle { theme::hex("#fa586a") } else { theme::hex("#c2c2c7") })
+                    .color(if shuffle { theme::accent_on_dark() } else { theme::hex("#c2c2c7") })
                     .disabled(!has_queue)
                     .on_click(move |_, _, cx| p.update(cx, |p, cx| p.toggle_shuffle(cx)))
             })
@@ -180,7 +180,7 @@ impl Render for FullPlayer {
                     "Repeat".into(),
                     icon(if repeat == Repeat::One { "repeat1" } else { "repeat" }, 16.0).into_any_element(),
                 )
-                .color(if repeat != Repeat::Off { theme::hex("#fa586a") } else { theme::hex("#c2c2c7") })
+                .color(if repeat != Repeat::Off { theme::accent_on_dark() } else { theme::hex("#c2c2c7") })
                 .disabled(!has_queue)
                 .on_click(move |_, _, cx| p.update(cx, |p, cx| p.cycle_repeat(cx)))
             });
@@ -250,7 +250,7 @@ impl Render for FullPlayer {
                 if delta == 0.0 {
                     return;
                 }
-                let step = crate::components::playback_dock::volume_scroll_step(&this.state, event.modifiers.shift, cx);
+                let step = crate::components::playback_dock::volume_scroll_step(&this.state, event.modifiers.alt || event.modifiers.control, cx);
                 let direction = if delta > 0.0 { 1.0 } else { -1.0 };
                 this.player.update(cx, |player, cx| {
                     let next = ((player.volume + direction * step / 100.0) * 100.0).round() / 100.0;
@@ -451,7 +451,9 @@ impl Render for FullPlayer {
         let panel_el = theme::with_tokens(cx, tokens.clone(), |cx| inspector::render_embedded(&state, &lyrics, panel, cx));
 
         let close_state = self.state.clone();
-        let client_frame = crate::components::window_chrome::client_side(window);
+        let client_frame = crate::components::window_chrome::custom_titlebar(window);
+        // macOS: keep the close button clear of the traffic lights.
+        let top_inset = crate::components::window_chrome::traffic_light_inset();
         div()
             .id("full-player")
             .absolute()
@@ -489,7 +491,7 @@ impl Render for FullPlayer {
                     .px(sz(24.0))
                     .py(sz(19.0))
                     .child(
-                        div().h(sz(36.0)).flex_none().flex().items_center().child(
+                        div().h(sz(36.0)).flex_none().flex().items_center().mt(sz(top_inset)).child(
                             IconButton::new("fs-close", "Close", icon("chevron-left", 22.0)).bare()
                                 .color(theme::hex("#c2c2c7"))
                                 .on_click(move |_, _, cx| {
