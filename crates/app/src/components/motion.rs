@@ -114,6 +114,26 @@ pub fn ease() -> impl Fn(f32) -> f32 + Clone {
     cubic_bezier(0.25, 0.1, 0.25, 1.0)
 }
 
+/// One-shot entrance: fades in while settling `dy` px up from below
+/// (`cubic-bezier(.2,.82,.2,1)`). The animation is keyed by `id`, so it replays
+/// when the id changes or when the element is shown again after being hidden.
+/// `dy == 0` fades only (for absolutely positioned elements that must not be
+/// made `relative`).
+pub fn enter<E>(el: E, id: impl Into<gpui::ElementId>, ms: u64, dy: f32) -> gpui::AnyElement
+where
+    E: gpui::Styled + IntoElement + 'static,
+{
+    use gpui::px;
+    if reduced() {
+        return el.into_any_element();
+    }
+    el.with_animation(id, Animation::new(Duration::from_millis(ms)).with_easing(cubic_bezier(0.2, 0.82, 0.2, 1.0)), move |el, t| {
+        let el = el.opacity((t / 0.8).min(1.0));
+        if dy == 0.0 { el } else { el.relative().top(px(dy * (1.0 - t))) }
+    })
+    .into_any_element()
+}
+
 /// `.spin { animation: spin 1s linear infinite }` on `LoaderCircle`.
 pub fn spinner(size: f32) -> gpui::AnyElement {
     if reduced() {

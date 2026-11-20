@@ -252,11 +252,6 @@ impl PerfOverlay {
         }
     }
 
-    /// The floating panel inside the main window.
-    pub fn new(state: gpui::Entity<AppState>) -> Self {
-        Self::with(state, Placement::Overlay, SharedFeed::default())
-    }
-
     /// The contents of the performance window, fed by [`measure_frames`].
     pub fn windowed(state: gpui::Entity<AppState>, feed: SharedFeed, cx: &mut Context<Self>) -> Self {
         // Nothing animates here, so refresh on a timer instead of every frame.

@@ -650,7 +650,7 @@ fn privacy(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyElemen
                 "refresh-cw",
                 "Check for updates",
                 format!(
-                    "Once a day, ask GitHub for the newest Volta on your channel and tell you if there is one. Stable follows tagged releases. Nightly follows the newest successful build of the main branch (the Actions tab on GitHub), which may be rough; open it to download your platform\u{2019}s artifact. Nothing is installed automatically. You have {}.",
+                    "Stable follows tagged releases. Nightly follows the newest successful build, open it to download your platform\u{2019}s artifact. You have {}.",
                     crate::build_info::summary()
                 ),
                 div()
@@ -888,8 +888,7 @@ fn performance(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyEl
     const ANIMATED: &[(&str, &str)] = &[("prominent", "Album and player views"), ("everywhere", "Everywhere"), ("off", "Off")];
     let bg_limit = pref(state, keys::BACKGROUND_FPS_LIMIT_KEY, cx) == "true";
     let experimental = pref(state, "volta-experimental-artwork-loading", cx) == "true";
-    let overlay = pref(state, keys::FRAME_MONITOR_KEY, cx) == "true";
-    let (fps_state, es, s1) = (state.clone(), state.clone(), state.clone());
+    let (fps_state, es) = (state.clone(), state.clone());
     let animated_value = {
         let mode = pref(state, keys::ANIMATED_ARTWORK_MODE_KEY, cx);
         if mode == "off" || pref(state, keys::ANIMATED_ARTWORK_KEY, cx) == "false" {
@@ -944,14 +943,6 @@ fn performance(state: &Entity<AppState>, tokens: &Tokens, cx: &mut App) -> AnyEl
                 checkbox("experimental-artwork", experimental, tokens, move |v, cx| {
                     set_pref(&es, "volta-experimental-artwork-loading", if v { "true" } else { "false" }, cx)
                 }),
-            ),
-            row(
-                tokens,
-                "orange",
-                "gauge",
-                "Performance overlay",
-                "Show rendering, runtime, network, and device diagnostics in the beta player.",
-                checkbox("frame-monitor", overlay, tokens, move |v, cx| set_pref(&s1, keys::FRAME_MONITOR_KEY, if v { "true" } else { "false" }, cx)),
             ),
         ],
         "Options that affect how smoothly Volta draws and how much power it uses.",

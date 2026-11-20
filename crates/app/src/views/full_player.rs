@@ -454,6 +454,7 @@ impl Render for FullPlayer {
         let client_frame = crate::components::window_chrome::custom_titlebar(window);
         // macOS: keep the close button clear of the traffic lights.
         let top_inset = crate::components::window_chrome::traffic_light_inset();
+        crate::components::motion::enter(
         div()
             .id("full-player")
             .absolute()
@@ -534,7 +535,10 @@ impl Render for FullPlayer {
                                     .child(panel_el),
                             ),
                     ),
-            )
-            .into_any_element()
+            ),
+            "full-player-enter",
+            260,
+            0.0,
+        )
     }
 }

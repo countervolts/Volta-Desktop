@@ -2,7 +2,7 @@
 //! floating dock). Port of the `.desktop-app` / `.workspace` layout.
 
 use gpui::{
-    Context, Entity, FontWeight, IntoElement, ParentElement, Render, Styled, Window, div, prelude::*, relative,
+    Context, Entity, FontWeight, IntoElement, ParentElement, Render, SharedString, Styled, Window, div, prelude::*, relative,
 };
 use gpui_component::Sizable as _;
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -26,6 +26,9 @@ pub struct Shell {
     filter_placeholder: String,
     search: Entity<InputState>,
     last_page: Option<Page>,
+    /// Route + loading state the page entrance animation is keyed on.
+    page_key: Option<(Page, Option<String>, bool)>,
+    page_nonce: u64,
     lyrics: Entity<crate::components::lyrics_view::LyricsView>,
     full_player: Option<Entity<crate::views::full_player::FullPlayer>>,
     dialog_inputs: crate::views::dialogs::DialogInputs,
@@ -35,8 +38,6 @@ pub struct Shell {
     main_scroll: gpui::ScrollHandle,
     /// The sidebar's own list has to scroll independently of the page.
     sidebar_scroll: gpui::ScrollHandle,
-    /// `PerformanceOverlay`, created while the frame monitor is on.
-    perf: Option<Entity<crate::components::perf_overlay::PerfOverlay>>,
     /// The message of a panic caught while building the page.
     crash: Option<String>,
 }
@@ -86,6 +87,8 @@ impl Shell {
             filter_placeholder: "Filter".into(),
             search,
             last_page: None,
+            page_key: None,
+            page_nonce: 0,
             lyrics,
             full_player: None,
             dialog_inputs,
@@ -99,7 +102,6 @@ impl Shell {
             },
             sidebar_scroll: gpui::ScrollHandle::new(),
             crash: None,
-            perf: None,
         }
     }
 
@@ -408,6 +410,12 @@ impl Render for Shell {
             window.focus(&handle, cx);
         }
         self.last_page = Some(route.page);
+        // Opening a page (or its data arriving) replays the entrance animation.
+        let page_key = (route.page, route.id.clone(), self.state.read(cx).page_loading);
+        if self.page_key.as_ref() != Some(&page_key) {
+            self.page_key = Some(page_key);
+            self.page_nonce += 1;
+        }
         // Shortcut follow-ups: focus a field, or scroll the page to the top.
         if let Some(target) = self.state.update(cx, |s, _| s.focus_request.take()) {
             let input = match target {
@@ -530,7 +538,15 @@ impl Render for Shell {
                     .pb(sz(pad_bottom))
                     // Re-check the sentinel distance as the page scrolls.
                     .on_scroll(cx.listener(|_, _, _, cx| cx.notify()))
-                    .child(self.guarded_page(content_width, window, cx))
+                    .child({
+                        let page = self.guarded_page(content_width, window, cx);
+                        crate::components::motion::enter(
+                            div().w_full().child(page),
+                            SharedString::from(format!("page-enter-{}", self.page_nonce)),
+                            300,
+                            12.0,
+                        )
+                    })
                     .children(crate::paging::sentinel(&self.state, cx)),
                 )
                 .when_some(pinned, |d, bar| d.child(div().absolute().top_0().left(sz(pad_x)).right(sz(pad_x)).child(bar)))
@@ -598,18 +614,6 @@ impl Render for Shell {
                     self.full_player
                         .get_or_insert_with(|| cx.new(|cx| crate::views::full_player::FullPlayer::new(state, cx)))
                         .clone()
-                })
-            })
-            .children({
-                // The toggle lives in Settings → Performance, in every build.
-                let on = self.state.read(cx).storage.get(volta_logic::storage::FRAME_MONITOR_KEY) == "true";
-                if !on {
-                    self.perf = None;
-                }
-                on.then(|| {
-                    let state = self.state.clone();
-                    let perf = self.perf.get_or_insert_with(|| cx.new(|_| crate::components::perf_overlay::PerfOverlay::new(state))).clone();
-                    gpui::deferred(perf).with_priority(1).into_any_element()
                 })
             })
             .children(crate::components::connection_banner::render(&self.state, cx))

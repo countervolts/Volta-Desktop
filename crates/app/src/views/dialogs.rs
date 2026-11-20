@@ -80,7 +80,7 @@ pub fn modal_with(
         .on_click(|_, _, cx| cx.stop_propagation())
         .child(div().id("dialog-scroll").flex_1().min_h_0().overflow_y_scroll().p(sz(padding)).child(content))
         .children(footer);
-    deferred(
+    deferred(crate::components::motion::enter(
         div()
             .id("dialog-overlay")
             .absolute()
@@ -93,8 +93,11 @@ pub fn modal_with(
             .justify_center()
             .py(sz(24.0))
             .on_click(move |_, _, cx| close(&a, cx))
-            .child(card),
-    )
+            .child(crate::components::motion::enter(card, "dialog-card-enter", 260, 14.0)),
+        "dialog-overlay-enter",
+        180,
+        0.0,
+    ))
     .with_priority(3)
     .into_any_element()
 }

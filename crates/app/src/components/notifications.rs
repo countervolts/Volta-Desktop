@@ -63,6 +63,8 @@ pub fn render(state: &Entity<AppState>, cx: &App) -> Option<gpui::AnyElement> {
     let id = notice.id;
     let card = div()
         .id(SharedString::from(format!("toast-{id}")))
+        // Clicks on the card (including its dismiss button) must not reach what is behind it.
+        .occlude()
         .flex()
         .items_center()
         .gap(sz(12.0))

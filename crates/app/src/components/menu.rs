@@ -258,6 +258,7 @@ pub fn render(state: &Entity<AppState>, cx: &mut App) -> Option<AnyElement> {
     Some(
         deferred(
             anchored().position(menu.position).anchor(menu.corner).snap_to_window_with_margin(px(8.0)).child(
+                crate::components::motion::enter(
                 div()
                     .id("context-menu")
                     .occlude()
@@ -278,6 +279,10 @@ pub fn render(state: &Entity<AppState>, cx: &mut App) -> Option<AnyElement> {
                     }])
                     .on_mouse_down_out(move |_, _, cx| close(&close_state, cx))
                     .children(rows),
+                "context-menu-enter",
+                150,
+                6.0,
+                ),
             ),
         )
         .with_priority(2)
