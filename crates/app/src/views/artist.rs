@@ -1,9 +1,10 @@
 //! Artist detail: the `route.page === "artist"` branch of App.tsx.
 //!
 //! Full-bleed `.artist-header` (cover art, shade gradients, name, album count,
-//! pin / play / favorite, share action), then Latest Release beside Top Songs,
+//! pin / play / shuffle / favorite, share action), then Latest Release beside Top Songs,
 //! Albums, and "You might also like" artists.
 
+use rand::seq::SliceRandom;
 use gpui::{
     AnyElement, App, BoxShadow, Entity, FontWeight, IntoElement, ObjectFit, ParentElement, SharedString, Styled,
     StyledImage, Window, div, img, linear_color_stop, linear_gradient, point, prelude::*,
@@ -94,6 +95,8 @@ pub fn render(state: &Entity<AppState>, content_width: f32, window: &mut Window,
     let songs: Vec<Song> = page.artist_songs.clone();
     let play_songs = songs.clone();
     let play_state = state.clone();
+    let shuffle_songs = play_songs.clone();
+    let shuffle_state = play_state.clone();
 
     let header = div()
         .relative()
@@ -189,31 +192,42 @@ pub fn render(state: &Entity<AppState>, content_width: f32, window: &mut Window,
                         .child(format!("{} albums in your library", page.albums.len())),
                 )
                 .child(
+                    // Play stays horizontally centered no matter how many
+                    // buttons flank it: fixed-width side flanks pin the outer
+                    // buttons against the play circle, so the row's midpoint
+                    // is always the play button's centre.
                     div()
                         .flex()
                         .items_center()
                         .justify_center()
-                        .gap(sz(16.0))
                         .mt(sz(18.0))
-                        .child({
-                            use volta_logic::storage::{Pin, PinKind};
-                            let pinned = state.read(cx).is_pinned(PinKind::Artist, &artist.id);
-                            let pin = Pin {
-                                kind: PinKind::Artist,
-                                id: artist.id.clone(),
-                                name: artist.name.clone(),
-                                cover_art: artist.cover_art.clone(),
-                                image_url: artist.artist_image_url.clone(),
-                            };
-                            let target = state.clone();
+                        .child(
                             div()
-                                .id("artist-pin-wrap")
-                                .on_click(move |_, _, cx| {
-                                    let pin = pin.clone();
-                                    target.update(cx, |s, cx| s.toggle_pin(pin, cx))
-                                })
-                                .child(round_action("artist-pin", 38.0, false, icon_with("pin", 17.0, None, pinned)))
-                        })
+                                .w(sz(108.0))
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .pr(sz(16.0))
+                                .child({
+                                    use volta_logic::storage::{Pin, PinKind};
+                                    let pinned = state.read(cx).is_pinned(PinKind::Artist, &artist.id);
+                                    let pin = Pin {
+                                        kind: PinKind::Artist,
+                                        id: artist.id.clone(),
+                                        name: artist.name.clone(),
+                                        cover_art: artist.cover_art.clone(),
+                                        image_url: artist.artist_image_url.clone(),
+                                    };
+                                    let target = state.clone();
+                                    div()
+                                        .id("artist-pin-wrap")
+                                        .on_click(move |_, _, cx| {
+                                            let pin = pin.clone();
+                                            target.update(cx, |s, cx| s.toggle_pin(pin, cx))
+                                        })
+                                        .child(round_action("artist-pin", 38.0, false, icon_with("pin", 17.0, None, pinned)))
+                                }),
+                        )
                         .child(
                             div()
                                 .id("artist-play-wrap")
@@ -231,18 +245,41 @@ pub fn render(state: &Entity<AppState>, content_width: f32, window: &mut Window,
                                     div().ml(sz(3.0)).child(icon_with("play", 25.0, None, true)),
                                 )),
                         )
-                        .child({
-                            let starred = artist.starred.is_some();
-                            let favorite = state.read(cx).is_favorite_id(&artist.id, starred);
-                            let (target, id) = (state.clone(), artist.id.clone());
+                        .child(
                             div()
-                                .id("artist-favorite-wrap")
-                                .on_click(move |_, _, cx| {
-                                    let id = id.clone();
-                                    target.update(cx, |s, cx| s.toggle_favorite("artist", id, starred, cx))
-                                })
-                                .child(round_action("artist-favorite", 38.0, false, icon_with("star", 18.0, None, favorite)))
-                        }),
+                                .w(sz(108.0))
+                                .flex()
+                                .items_center()
+                                .justify_start()
+                                .pl(sz(16.0))
+                                .gap(sz(16.0))
+                                .child(
+                                    div()
+                                        .id("artist-shuffle-wrap")
+                                        .on_click(move |_, _, cx| {
+                                            if shuffle_songs.is_empty() {
+                                                return;
+                                            }
+                                            let mut songs = shuffle_songs.clone();
+                                            songs.shuffle(&mut rand::rng());
+                                            let player = shuffle_state.read(cx).player.clone();
+                                            player.update(cx, |p, cx| p.play_queue(songs, 0, cx));
+                                        })
+                                        .child(round_action("artist-shuffle", 38.0, false, icon_with("shuffle", 17.0, None, false))),
+                                )
+                                .child({
+                                    let starred = artist.starred.is_some();
+                                    let favorite = state.read(cx).is_favorite_id(&artist.id, starred);
+                                    let (target, id) = (state.clone(), artist.id.clone());
+                                    div()
+                                        .id("artist-favorite-wrap")
+                                        .on_click(move |_, _, cx| {
+                                            let id = id.clone();
+                                            target.update(cx, |s, cx| s.toggle_favorite("artist", id, starred, cx))
+                                        })
+                                        .child(round_action("artist-favorite", 38.0, false, icon_with("star", 18.0, None, favorite)))
+                                }),
+                        ),
                 ),
         );
 
